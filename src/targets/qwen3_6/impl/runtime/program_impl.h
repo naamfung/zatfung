@@ -856,17 +856,27 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     const std::uint32_t text_page_descriptors = logical_page_capacity(decoder->text_kv.page_pool());
     const std::uint32_t text_addressable_pages =
         decoder->text_kv.execution_tables().logical_page_capacity();
-    if (text_page_descriptors < text_addressable_pages) {
+    // KVMem parks the window-external pages of the whole address space in its own Host tier,
+    // sized for the worst case -- every page evicted. Those pages need descriptors exactly as the
+    // context cache's Host KV ones do, so counting only --host-kv-mib charges a KVMem run for
+    // every page twice: once in the tier that actually parks them, and once in a Host layer it
+    // never writes to. Both tiers cover the same pages, so take whichever names more of them --
+    // at a long context that is the difference between one host allocation and two.
+    const std::uint64_t kvmem_host_pages = plan.kvmem.enabled ? text_addressable_pages : 0;
+    const std::uint64_t text_descriptors =
+        std::max<std::uint64_t>(text_page_descriptors, kvmem_host_pages);
+    if (text_descriptors < text_addressable_pages) {
         const std::uint32_t device_pages = decoder->text_kv.page_pool().capacity_pages();
         throw std::invalid_argument(
             "KV page store cannot describe the configured context: " +
             std::to_string(device_pages) + " device + " +
             std::to_string(text_page_descriptors - device_pages) + " host pages, but the context "
             "needs " + std::to_string(text_addressable_pages) +
-            " logical pages; raise --host-kv-mib or the KV device budget");
+            " logical pages; raise --host-kv-mib (--kvmem parks those pages itself, so it does "
+            "not need this layer) or the KV device budget");
     }
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
-        decoder->text_kv.page_pool(), text_page_descriptors);
+        decoder->text_kv.page_pool(), static_cast<std::uint32_t>(text_descriptors));
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity(), plan.kvmem);
