@@ -4,7 +4,8 @@
 # zatfung — 疾风 (zat6 fung1)
 
 > **zatfung**（粤语 *zat6 fung1*，疾风）是一个 CUDA 优先的 C++ 推理引擎，
-> 面向**真假三元（Q1 / Q2）Bonsai 2 27B**，派生自 NINFER 家族。
+> 面向 Bonsai 2 27B 的两种三元权重格式 —— 真三元 `PTQ1_0_G128`（base-3 三进制打包，
+> 28 B/128 权重）与假三元 `PQ2_0_G128`（2 bit 码，34 B/128），派生自 NINFER 家族。
 > 一个源码树同时覆盖四档 NVIDIA 架构：
 
 | `CMAKE_CUDA_ARCHITECTURES` | 架构 | 代表显卡 | 说明 |
@@ -13,6 +14,15 @@
 | `86` | Ampere | RTX 3090 / 3060 Ti | **主要开发目标**（本机 3060 Ti） |
 | `89` | Ada | RTX 4090 / 4070 | 本 fork 的原始目标线 |
 | `120a` | Blackwell | RTX 5090 | 参考实现（NVFP4 W4A4 TMA） |
+
+四档都能全量构建，但**"能编译"不等于"能跑"**，验收程度并不相同：
+
+- `86`（本机 3060 Ti）已跑通构建 + 单测 + 端到端生成。
+- `75` 目前**只到编译层**：全量构建通过，MMA 与 warp 归约的 Turing 降级做过硬件级等价验证
+  （在 sm_86 上与被替换的指令逐位比对），但**尚无 2080 Ti 实机验收**；而且 prompt attention
+  的 tile 超出 Turing 每 block 64 KiB 的 opt-in 上限，在 2080 Ti 上首次调用即失败。
+  缺口清单、实测数据与后续步骤见
+  [`docs/zatfung-sm86-sm75-port.md`](docs/zatfung-sm86-sm75-port.md) 第 8 节。
 
 > **构建入口是 `builder.go`** —— 一个 Go 写的生产标准构建器。它会自己探测并拼装
 > MSVC 环境（不依赖 `vcvars64.bat`），因此在 `cmd.exe` 被禁用、Visual Studio
