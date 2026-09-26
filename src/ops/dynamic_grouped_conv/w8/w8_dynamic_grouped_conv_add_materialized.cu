@@ -31,8 +31,8 @@ using Launch = W8Launch;
 
 template <int InputRows, int TileColumns>
 void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
-    // sm_86/sm_89: the 8-warp tile-40 layout (49664 B) exceeds the 48 KiB static shared
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
+    // sm_75/sm_86/sm_89: the 8-warp tile-40 layout (49664 B) exceeds the 48 KiB static shared
     // memory limit; the 4-warp layout (24832 B) matches the 17408-row branch.
     constexpr int Warps = TileColumns <= 32 ? 8 : 4;
 #else

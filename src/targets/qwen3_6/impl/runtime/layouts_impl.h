@@ -794,13 +794,13 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
-    // sm_86 joins 89/120a: the FP8-only kernels are filtered out at build time
+    // sm_75 and sm_86 join 89/120a: the FP8-only kernels are filtered out at build time
     // (see src/CMakeLists.txt and ops/fp8_legacy_stubs.cpp), so every route the
-    // planner can pick below exists in an SM86 build.
+    // planner can pick below exists in an SM75/SM86 build.
     if (device.compute_capability() != 120 && device.compute_capability() != 89 &&
-        device.compute_capability() != 86) {
+        device.compute_capability() != 86 && device.compute_capability() != 75) {
         throw std::invalid_argument(
-            "Qwen3.6 family runtime requires compute capability 12.0, 8.9 or 8.6");
+            "Qwen3.6 family runtime requires compute capability 12.0, 8.9, 8.6 or 7.5");
     }
 }
 
@@ -836,8 +836,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
+#if defined(NINFER_SM75)
+            // Turing materializes far more driver/module state per graph executable than the
+            // Ampere-and-later numbers below assume, so the ordinary allowance is raised to the
+            // level that actually covers capture on an RTX 2080 Ti.
+            impl->graph_allowance_bytes = checked_mul(64ULL * kMiB, impl->max_concurrency,
+                                                      "ordinary exact-b graph allowance");
+#else
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
+#endif
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(
@@ -846,7 +854,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
+#if defined(NINFER_SM75)
+                    return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+#else
                     return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+#endif
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,

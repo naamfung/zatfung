@@ -90,8 +90,8 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 constexpr auto kLaunchers =
     make_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
 
-#if !defined(NINFER_SM86) && !defined(NINFER_SM89)
-// The medium-T split-K kernel exceeds the 48 KiB static shared memory limit of sm_86/sm_89;
+#if !defined(NINFER_SM75) && !defined(NINFER_SM86) && !defined(NINFER_SM89)
+// The medium-T split-K kernel exceeds the 48 KiB static shared memory limit of sm_75/sm_86/sm_89;
 // those architectures route medium T through exact-T/decode slices (see the launcher below).
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
@@ -133,8 +133,8 @@ void w8_pair_splitk_medium_launch(W8PairScheduleId schedule, const Tensor& x,
         first_out.ne[1] != x.ne[1] || second_out.ne[0] != kRows || second_out.ne[1] != x.ne[1]) {
         throw std::invalid_argument("W8 medium pair requires [1024,2048] and T>=33");
     }
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
-    // sm_86/sm_89: chunk the medium T into exact-T slices (32) + a decode_r16 tail.
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
+    // sm_75/sm_86/sm_89: chunk the medium T into exact-T slices (32) + a decode_r16 tail.
     (void)schedule;
     std::int32_t offset = 0;
     while (offset < x.ne[1]) {

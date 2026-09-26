@@ -27,8 +27,8 @@ void launch_active_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStrea
                              : ActiveCols <= 32 ? 32
                              : ActiveCols <= 40 ? 40
                                                 : 48;
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
-    // sm_86/sm_89: schedule capped to the 48 KiB static shared memory limit.
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
+    // sm_75/sm_86/sm_89: schedule capped to the 48 KiB static shared memory limit.
     constexpr auto ScaleAccess = W8SmallTMmaScaleAccess::Shared;
     using Geometry  = W8LinearGeometry<2 * kIntermediate, kHidden>;
     using RowPolicy = W8SwiGluPairedRows<kIntermediate>;

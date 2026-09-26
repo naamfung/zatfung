@@ -30,7 +30,7 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cuda
                               : ActiveCols <= 32 ? 32
                               : ActiveCols <= 40 ? 40
                                                  : 48;
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     constexpr int KWarps    = ActiveCols <= 24 ? 8 : 4;
     constexpr int MinBlocks = KWarps == 4 ? 4 : 2;
     constexpr auto ScaleAccess = W8SmallTMmaScaleAccess::Shared;
@@ -68,8 +68,8 @@ void require_problem(const Tensor& x, const Weight& w, const Tensor& out) {
     }
 }
 
-#if !defined(NINFER_SM86) && !defined(NINFER_SM89)
-// The medium-T split-K kernel exceeds the 48 KiB static shared memory limit of sm_86/sm_89;
+#if !defined(NINFER_SM75) && !defined(NINFER_SM86) && !defined(NINFER_SM89)
+// The medium-T split-K kernel exceeds the 48 KiB static shared memory limit of sm_75/sm_86/sm_89;
 // those architectures route medium T through exact-T/decode slices (see the launchers below).
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -95,8 +95,8 @@ void launch_w8_exact_t_splitk(const Tensor& x, const Weight& w, Tensor& out, cud
 void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
     require_problem(x, w, out);
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
-    // sm_86/sm_89: the composite route covers all T>=33 (medium-T launchers delegate here).
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
+    // sm_75/sm_86/sm_89: the composite route covers all T>=33 (medium-T launchers delegate here).
     if (x.ne[1] < 33) {
         throw std::invalid_argument("W8 exact-T composite requires T>=33");
     }
@@ -142,7 +142,7 @@ void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cuda
         throw std::invalid_argument("W8 DFlash medium route requires T=49..128");
     }
 
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     launch_w8_exact_t_composite(x, w, out, stream);
 #else
     if (t <= 64) {
@@ -172,7 +172,7 @@ void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cuda
 
 void launch_w8_medium_splitk_c144(const Tensor& x, const Weight& w, Tensor& out,
                                   cudaStream_t stream) {
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     launch_w8_exact_t_composite(x, w, out, stream);
 #else
     launch_medium_route<144, 2, 9, 2>(x, w, out, stream);

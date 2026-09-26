@@ -302,3 +302,127 @@ apps\ninfer.exe : fatal error LNK1120: 2 个无法解析的外部命令
 
 > 这类缺口的通用形态值得记住：**同一个 `#else` 分支里，stub 的覆盖面必须与头文件声明的
 > 公开接口完全一致**。上游漏了两个，只有在"真的没有 ffmpeg"的构建里才会以 LNK2019 现形。
+
+---
+
+## 8. SM75 算子齐备核验与补齐（2026-09-26）
+
+本节回答一个问题：**sm_75 的算子集与 sm_86 是否等效**。做法是先让编译器给出权威缺口清单
+（`builder.exe -arch 75` 全量编译），再逐处补齐，最后对数值敏感的部分做硬件级等价性验证。
+
+### 8.1 结论
+
+**构建层已齐备**：`builder.exe -arch 75` 全量构建通过（`BUILD_EXIT=0`，含产物齐全性自检），
+产出 `ninfer.exe` / `ninfer-serve.exe` / `ninfer-perplexity.exe`，`cuobjdump -lelf` 只含 `sm_75`。
+
+**运行层尚未齐备**：至少 prompt attention 两个内核在 2080 Ti 上必然启动失败（见 §8.5）。
+即"编译得过"不等于"跑得起来"，本轮只把前者做到了，后者需要 Turing 实机才能收口。
+
+### 8.2 实际缺口与补齐（全部由编译错误定位）
+
+首次 `-arch 75` 编译在 `device.h` 的 `#error` 上停机；拆掉后逐层暴露下面这些，
+每一处都是"sm_80+ 专属能力被无条件使用"：
+
+| # | 位置 | 缺口 | 处理 |
+|---|---|---|---|
+| 1 | `src/core/device.h` `kTargetSmCount` | `#else` 直接 `#error`，75 无分支 | SM75=68（2080 Ti/TU102）；顺带把 `#else` 从 `#error` 改为 120a 的 170（RTX 5090/GB202）—— **该 `#else` 是 120a 分支，说明默认架构 `120a` 此前根本编不过** |
+| 2 | `src/ops/common/memory.cuh` | `cp.async*` / `__pipeline_*` 无条件使用 | 从 2080ti 线整段移植 `#if defined(NINFER_SM75)` 同步回退 |
+| 3 | `src/ops/common/math.cuh` | `cvt.rn.bf16x2.f32` 为 sm_80+ | `__floats2bfloat162_rn` 回退（Turing 无 bf16 转换指令） |
+| 4 | `src/ops/common/mma.cuh` | `m16n8k16` / `m16n8k32` / bf16 / tf32 MMA 均为 sm_80+ | 完整 Turing 降级层，见 §8.3 |
+| 5 | `src/ops/kernel/sampling_device.cuh` | `__reduce_max_sync` 为 sm_80+ | shuffle butterfly 回退（`sampling_warp_max`），只对 mask 内 lane 归约 |
+| 6 | w8 系列 7 文件 21 处 | `NINFER_SM86 \|\| NINFER_SM89` 未含 75 | 条件扩为 `75 \|\| 86 \|\| 89`，见 §8.4 |
+| 7 | `src/targets/qwen3_6/impl/runtime/layouts_impl.h` | 启动校验硬编码 `120/89/86`，75 会被拒 | 加入 75；并把 Turing 的 CUDA graph 预留从 2080ti 线移植进来（普通 12→64 MiB，MTP 12/82→64/96 MiB） |
+| 8 | `builder.go` 测试链接路径 | 缺 `-Xcompiler=/utf-8` | 补齐（与 CMake 一致）。缺它时 MSVC 按代码页 936 解码 UTF-8 中文注释，某个多字节字符尾字节被当作续行符，把 `#if` 链拉成不平衡并报 C1018"意外的 #elif" |
+
+### 8.3 Turing 降级层的正确性验证（本轮最实质的部分）
+
+Turing 的 HMMA 只有两个形状：fp16 的 `m16n8k8` 与 int8 的 `m8n8k16`。更宽的形状必须由它们
+重组，而 bf16/tf32 完全没有张量核通路，回退成 warp-shuffle + fp32 FMA。
+
+这类重组"错也不会报错，只会算错"，所以不能靠抄。验证手段是
+**新建 `tests/mma_emulation_test.cu`**：在 `#include mma.cuh` 前定义 `NINFER_SM75`，于是被测的
+就是生产降级代码本身；再让它跑在本机 sm_86 上（sm_86 同时具备被替换的指令与被用作积木的指令），
+两边吃同一组 fragment 寄存器，直接逐 lane 比对。PTX 的 fragment 布局是跨架构固定的，
+所以这个恒等式在 sm_86 上成立即在 Turing 上成立。
+
+实测（4 组随机 fragment，共 4096 lane）：
+
+| 降级 | 被替换的形状 | 实测最大偏差 |
+|---|---|---|
+| `mma_f16` | `m16n8k16.f32.f16` | **0**（逐位一致） |
+| `mma_f16_f16acc` | `m16n8k16.f16.f16` | **0** |
+| `mma_s8` | `m16n8k32.s32.s8` | **0**（整数，要求精确） |
+| `mma_bf16` | `m16n8k16.bf16` | 1.9e-06（fp32 求和顺序差） |
+| `mma_tf32_bits` | `m16n8k8.tf32` | 9.5e-07（同上） |
+
+另用 SASS 反汇编确认降级分支**确实被编译**（否则上面全 0 可能只是因为退化成了原生指令的
+同义重复）：`IMMA.8816`×4、`HMMA.1688.F16`×2、`HMMA.1688.F32`×4 —— 测试里除了 `mma_s8` 的
+降级没有任何地方写 `m8n8k16`，它的出现即证明分支生效。
+
+> **⚠️ 已发现 2080ti 线的 `mma_f16`/`mma_s8` 降级是错的，不要照抄。**
+> 它写的是 `(a0, a2, b0) + (a1, a3, b1)`。按 PTX 布局，`a1` 是"第 8-15 行、K 0-7"、
+> `a2` 是"第 0-7 行、K 8-15"，所以它把 K 的两半配错了行。测试里把它作为**反向对照**跑了一遍：
+> **4096/4096 个元素全部不符**。同一份文件里它的 `mma_bf16` 模拟用的却是正确布局，
+> 两处自相矛盾。zatfung 侧按 PTX 语义重推并以上表实测通过；`mma_s8` 同样是重推的
+> （正确配对：`(c0,c1,a0,b0) (c2,c3,a1,b0) (c0,c1,a2,b1) (c2,c3,a3,b1)`）。
+
+### 8.3.1 warp 归约降级的验证
+
+`__reduce_max_sync` 同样只出现在 sampler 的 tile merge 里（§8.2 第 5 条）。用同一套办法验证：
+新建 `tests/sm75_warp_reduce_test.cu`，在 include 前定义 `NINFER_SM75` 取生产实现，
+跑在 sm_86 上，与 `__reduce_max_sync` **以及宿主机算出的期望值**三方比对
+（主机期望值是必要的 —— 只比两边会漏掉"两个都错"）。
+
+实测：7 种 mask × 16 轮随机值，全部通过。mask 集合含 `0xffffffff / 0xffff / 0xff / 0xf /
+0x3 / 0x1`（对应生产里的 `(1u << kSamplingTileWarps) - 1u`）与一个**非连续 mask
+`0x55555555`** —— 后者生产用不到，但它证明降级是按 mask 过滤的，而不是只对低位连续段成立。
+
+> 测试写对的前提之一值得记下：这两个原语都要求**只有 mask 内的 lane 执行**，mask 外的线程
+> 必须不活跃（否则 sm_86 上直接 `cudaErrorIllegalInstruction`）。生产调用点天然满足
+> （在 `if (lane < kSamplingTileWarps)` 里），测试必须显式复现这一约定。
+
+
+### 8.4 未从 2080ti 线照搬的部分（及理由）
+
+| 对象 | 为什么没有直接移植 |
+|---|---|
+| w8 调度表 / 几何表 | 那边的 w8 文件是**改版后的重设计**（几何表不同，含 zatfung 没有的 `W8DFlash2Attention`，T 区间也不同），直接覆盖会改变本仓已验证的 sm86 行为。改用架构上等价的判据：**sm_75 的每 block 静态 smem 上限（48 KiB）与 sm_86/89 相同**，甚至更宽松的总量（64 KiB/SM < 100 KiB/SM），所以凡是本仓因 48 KiB 静态上限而裁剪或排除的路线，sm75 必须与 sm86/89 同侧 —— 即 §8.2 第 6 条那个条件扩展 |
+| GDN cooperative grid 上限表 | 那边按架构硬编码（68/164/340 …）；本仓用运行时 `device_sm_count()` × `cudaOccupancyMaxActiveBlocksPerMultiprocessor` 结果，**本身就对任何架构自适应**，无需表 |
+| attention | 那边根本没有 `softmax_attention/dense/causal_cache/`（两条线的 attention 组织完全不同），没有可搬的对照物 |
+
+### 8.5 剩余运行期阻塞（未修，需实机才能收口）
+
+| 项 | 数据 | 影响 |
+|---|---|---|
+| `kCausalPromptSmemBytes` | (64+2·64)×256×2 = **98304 B** | 超过 sm_75 每 block 64 KiB 的 opt-in 上限，`cudaFuncSetAttribute` 在 75 上直接失败 |
+| `kCausalPromptI8SmemBytes` | **92672 B**（非 SM89 分支） | 同上 |
+| → 后果 | prompt attention（bf16 与 int8 两条都要）在 2080 Ti 上**首次调用即抛错** | prefill attention 是核心算子，需重定 tile（例：Br/Bc 64→32 可把 bf16 降到 48 KiB），并重算 i8 的 4-consumer 调度 |
+| `small_t` 动态 arena | `4 × KeyBlock(64) × 256` = **65536 B**，正好压在 64 KiB 上限 | 当前值应当可行，但毫无余量，值得留意 |
+| FP8 A8 / FP8 KV | 已在构建期剔除（§7.1） | 75/86 上 `--kv-dtype fp8` 不可用，需 int8 或 bf16 |
+
+**建议的下一步**：找一台 2080 Ti 实机，按 §8.5 重定 prompt attention 的 tile，再跑
+`ninfer-perplexity`（§4 的验收口径）。在那之前，sm_75 应视为"可构建、未验收"档位。
+
+### 8.6 顺带发现：`BUILD_TESTING=ON` 的 Windows 全量构建本来就是坏的
+
+本轮为做 sm86 回归而跑了一次**全量** `-arch 86`（此前一直用 `-target ninfer-serve,…` 只建指定目标），
+在第 4 个目标就停机：
+
+```
+tests/test_pretty_logging.cpp(6): fatal error C1083: 无法打开包括文件: "unistd.h"
+```
+
+`test_pretty_logging.cpp` 无条件 `#include <unistd.h>`（POSIX 头，Windows 没有），
+`tests/CMakeLists.txt:67` 注册它时也没有 `WIN32` 门控（同文件 :431 对另一个测试是有门控的，
+说明这是漏网）。**与本次改动无关**：它的包含链（`product/logging/*` + spdlog + MSVC/UCRT）
+里没有本次碰过的任何文件；`git status` 也显示该文件自 baseline 起未改。
+
+之前没暴露的原因很直接：`_build_86` 的 `BUILD_TESTING=ON`，但历次构建都用 `-target` 只建
+引擎目标，这个测试从未被编译过；而 `_build_75` 是全新配置，`BUILD_TESTING` 默认 OFF，
+所以 sm75 全量构建反而顺利。
+
+**要修的话**：给 `test_pretty_logging.cpp` 的 `unistd.h` 加 POSIX 门控（或按
+`tests/CMakeLists.txt:431` 的做法在 Windows 上 `DISABLE_REASON`）。
+本轮未动它 —— 它不在本次任务范围内，且改测试平台门控需要单独确认。
+
+

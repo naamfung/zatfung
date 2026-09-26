@@ -21,12 +21,14 @@ int device_sm_count();
 // launch policies cannot query the runtime, and the host launcher that must reproduce such a
 // policy exactly has to agree with it at compile time; those two sites use this constant, every
 // other site uses device_sm_count().
-#if defined(NINFER_SM89)
+#if defined(NINFER_SM75)
+inline constexpr int kTargetSmCount = 68; // NVIDIA GeForce RTX 2080 Ti (TU102)
+#elif defined(NINFER_SM89)
 inline constexpr int kTargetSmCount = 128; // NVIDIA GeForce RTX 4090
 #elif defined(NINFER_SM86)
 inline constexpr int kTargetSmCount = 82; // NVIDIA GeForce RTX 3090
 #else
-#error "NInfer requires NINFER_SM86 or NINFER_SM89"
+inline constexpr int kTargetSmCount = 170; // NVIDIA GeForce RTX 5090 (GB202), the 120a reference
 #endif
 
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device

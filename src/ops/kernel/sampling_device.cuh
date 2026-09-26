@@ -158,6 +158,26 @@ __device__ __forceinline__ int sampling_partial_offset(const SamplingWorkspace& 
     return ((col * workspace.partial_stride + partial) * kSamplerCandidateCap) + j;
 }
 
+// Max over the lanes named in `mask`, used by the tile merge below to find the head of the
+// current rank. `__reduce_max_sync` is sm_80+, so Turing reduces through a shuffle butterfly;
+// only the mask lanes take part, and a partner outside the mask is skipped instead of folded in
+// (its incoming value is undefined). The XOR butterfly gives every mask lane the same max.
+__device__ __forceinline__ unsigned int sampling_warp_max(unsigned int mask, unsigned int value) {
+#if defined(NINFER_SM75)
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    unsigned int result = value;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const unsigned int other   = __shfl_xor_sync(mask, result, offset);
+        const int          partner = lane ^ offset;
+        if (((mask >> partner) & 1u) != 0u && other > result) { result = other; }
+    }
+    return result;
+#else
+    return __reduce_max_sync(mask, value);
+#endif
+}
+
 __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamplerItemsPerThread],
                                                 int cap, SamplingWorkspace workspace, int col,
                                                 int partial, SamplingTileTopKStorage& storage) {
@@ -181,9 +201,9 @@ __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamp
             const unsigned long long key =
                 storage.candidates[lane * kSamplerCandidateCap + position];
             const unsigned int high     = static_cast<unsigned int>(key >> 32);
-            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
+            const unsigned int max_high = sampling_warp_max(kMergeMask, high);
             const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
-            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
+            const unsigned int max_low  = sampling_warp_max(kMergeMask, low);
             const unsigned int winners =
                 __ballot_sync(kMergeMask, high == max_high && low == max_low);
             const int source = __ffs(static_cast<int>(winners)) - 1;
@@ -220,7 +240,7 @@ __device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSampl
         int position                      = 0;
         for (int rank = 0; rank < cap; ++rank) {
             const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
-            const unsigned int best    = __reduce_max_sync(kMergeMask, key);
+            const unsigned int best    = sampling_warp_max(kMergeMask, key);
             const unsigned int winners = __ballot_sync(kMergeMask, key == best);
             const int source           = __ffs(static_cast<int>(winners)) - 1;
             if (lane == 0) {

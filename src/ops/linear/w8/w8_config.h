@@ -56,8 +56,8 @@ struct W8SmallTMmaSchedule {
 
 template <int TileTokens, int ActiveTokens>
 using W8SmallTMmaDefaultSchedule = W8SmallTMmaSchedule<
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
-    // sm_86/sm_89: warp/block schedule capped to the 48 KiB static shared memory limit.
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
+    // sm_75/sm_86/sm_89: warp/block schedule capped to the 48 KiB static shared memory limit.
     (TileTokens <= 24 ? 8 : 4), TileTokens, (TileTokens <= 24 ? 2 : 4),
     W8SmallTMmaScaleAccess::Shared>;
 #else
@@ -107,7 +107,7 @@ struct W8LinearSmallTProductionSchedule<W8MtpInputProjectionGeometry, ActiveToke
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
     static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
     static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : 2;
     using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess>;
@@ -131,7 +131,7 @@ struct W8LinearSmallTProductionSchedule<W8MtpAttentionProjectionGeometry, Active
                                                             : 48;
     static constexpr int kKWarps =
         ActiveTokens <= 4 || (ActiveTokens >= 17 && ActiveTokens <= 22) ? 8 : 4;
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
     static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : (kKWarps == 8 ? 2 : 3);
     using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess>;
@@ -153,7 +153,7 @@ struct W8LinearSmallTProductionSchedule<W8MtpAttentionOutputGeometry, ActiveToke
                                        : ActiveTokens <= 32 ? 32
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
     static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
     static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : 2;
@@ -181,7 +181,7 @@ struct W8LinearSmallTProductionSchedule<W8MtpGateUpProjectionGeometry, ActiveTok
                                        : ActiveTokens <= 48 ? 48
                                                             : 56;
     static constexpr int kKWarps     = ActiveTokens >= 22 && ActiveTokens <= 24 ? 8 : 4;
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
     static constexpr auto kActivationStage =
         ActiveTokens <= 4 || (ActiveTokens >= 9 && ActiveTokens <= 15)
@@ -213,7 +213,7 @@ struct W8LinearSmallTProductionSchedule<W8MtpDownProjectionGeometry, ActiveToken
                                        : ActiveTokens <= 32 ? 32
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
     static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : 2;
     static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
@@ -237,7 +237,7 @@ struct W8LinearSmallTProductionSchedule<W835bMtpProjectionGeometry, ActiveTokens
                                        : ActiveTokens <= 32 ? 32
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     static constexpr int kKWarps     = ActiveTokens <= 12 ? 8 : 4;
     static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : (kKWarps == 16 ? 1 : 2);
     static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;

@@ -28,8 +28,8 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
                              : ActiveCols <= 32 ? 32
                              : ActiveCols <= 40 ? 40
                                                 : 48;
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
-    // sm_86/sm_89: warp/block schedule capped to the 48 KiB static shared memory limit.
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
+    // sm_75/sm_86/sm_89: warp/block schedule capped to the 48 KiB static shared memory limit.
     constexpr int KWarps    = ActiveCols <= 24 ? 8 : 4;
     constexpr int MinBlocks = KWarps == 4 ? 4 : 2;
     constexpr auto ScaleAccess = W8SmallTMmaScaleAccess::Shared;
@@ -67,8 +67,8 @@ constexpr auto kK4096ProjectionLaunchers = make_projection_launchers<4096>(
 constexpr auto kK6144ProjectionLaunchers = make_projection_launchers<6144>(
     std::make_index_sequence<kLastExactCols - kFirstExactCols + 1>{});
 
-#if !defined(NINFER_SM86) && !defined(NINFER_SM89)
-// The medium-T split-K kernel exceeds the 48 KiB static shared memory limit of sm_86/sm_89;
+#if !defined(NINFER_SM75) && !defined(NINFER_SM86) && !defined(NINFER_SM89)
+// The medium-T split-K kernel exceeds the 48 KiB static shared memory limit of sm_75/sm_86/sm_89;
 // those architectures route medium T through exact-T/decode slices (see the launcher below).
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
@@ -114,7 +114,7 @@ void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
     if ((weight.k != 4096 && weight.k != 6144) || t < 49 || t > 128) {
         throw std::invalid_argument("W8 linear_add medium split-K requires T=49..128");
     }
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
+#if defined(NINFER_SM75) || defined(NINFER_SM86) || defined(NINFER_SM89)
     std::int32_t offset = 0;
     while (offset < t) {
         const std::int32_t count = std::min<std::int32_t>(kLastExactCols, t - offset);

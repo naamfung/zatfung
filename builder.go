@@ -387,8 +387,12 @@ func runTestMode(repoRoot, vsRoot, msvcVer, sdkVer, files, testArgs string, cuda
 			kvmemCuda, _ := filepath.Glob(filepath.Join(repoRoot, "src", "kvmem", "*.cu"))
 			coreSources = append(coreSources, kvmemCuda...)
 			// core 层的 device.h 依赖架构宏（与 CMake 的定义保持一致）。
+			// /utf-8 同样与 CMake 保持一致：源码树里的头文件带中文注释，按系统代码页
+			// (936) 解码时某个多字节字符的尾字节会被当成续行符吃掉下一行，把 #if 链
+			// 拉成不平衡并炸出 C1018 "意外的 #elif"。.cpp 分支早已带上该开关。
 			archMacro := "NINFER_SM" + strings.ToUpper(archID)
 			nvccArgs := []string{"-arch=sm_" + archID, "-std=c++20", "-D" + archMacro,
+				"-Xcompiler=/utf-8",
 				"-I" + filepath.Join(repoRoot, "src"), "-I" + filepath.Join(repoRoot, "include")}
 			nvccArgs = append(nvccArgs, coreSources...)
 			// arena.cu 的 D3D12 residency 特性需要这两个导入库（SDK 的 LIB 已在环境里）。
