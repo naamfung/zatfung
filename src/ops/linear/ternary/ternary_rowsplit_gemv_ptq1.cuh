@@ -29,6 +29,15 @@
 // reference CUDA dequantizer (vec_dot_ptq1_0_q8_1): bytes are multiplied by 3^n in 16-bit
 // lanes where the product cannot carry across lanes, truncated to 8 bits exactly like the
 // scalar `(uint8_t)(raw * pow3[n])` cast, and the digit falls out of one more x3/shift pair.
+//
+// The T == 1 kernel keeps the whole warp on ONE straight-line body: the qh tail differs from
+// the main path only in lane-only properties (which word the four code bytes come from, which
+// byte pair the second half re-reads, and that half's trit level), so those hoist into a
+// per-lane context and the group loop carries no branch at all. Branching on `lane < 30`
+// instead cost every warp a second path per group for 8 of the group's 128 weights, and the
+// serialised paths measured 1.5-1.9x slower than this form on the target card. The tile and
+// prefill kernels keep the branching decoder: they amortise the decode over several tokens and
+// were not on the decode-critical path this change was measured against.
 
 #include "ternary_rowsplit_gemv.cuh"
 #include "ternary_rowsplit_storage.cuh"
@@ -50,6 +59,34 @@ __device__ __forceinline__ int ptq1_lane_act0(int lane) {
     return 120 + 4 * (lane - 30);
 }
 
+// Per-lane decode state for the T == 1 kernel. Every field depends on the lane alone, so the
+// whole record is computed once before the group loop and the loop body stays uniform.
+struct PTQ1LaneContext {
+    int code_off         = 0;       // byte offset of this lane's four code bytes in a group
+    std::uint32_t p_lo   = 1;       // 3^n applied to the low half
+    std::uint32_t p_hi   = 1;       // 3^n' applied to the high half (n' = n + 1 on the tail)
+    std::uint32_t sel_hi = 0x4342u; // byte pair the high half re-reads
+    std::int32_t act0    = 0;
+    bool tail            = false;   // this lane carries weights 120..127 from the high plane
+};
+
+__device__ __forceinline__ PTQ1LaneContext ptq1_lane_context(int lane) {
+    PTQ1LaneContext context;
+    const bool c16 = lane < 20;
+    const int i    = c16 ? lane : lane - 20;
+    context.tail   = lane >= 30;
+    // Lanes 30/31 keep a valid in-group code offset (16 and 20) so the code word they load and
+    // discard still lies inside the 24-byte group.
+    context.code_off = c16 ? 4 * (i & 3) : 16 + 4 * (i & 1);
+    const int n_lo   = context.tail ? 2 * (lane - 30) : (c16 ? (i >> 2) : (i >> 1));
+    context.p_lo     = ternary_pow3(n_lo);
+    context.p_hi     = ternary_pow3(context.tail ? n_lo + 1 : n_lo);
+    // The tail reads the same byte pair for both halves, so it must not switch to bytes 2/3.
+    context.sel_hi = context.tail ? 0x4140u : 0x4342u;
+    context.act0   = ptq1_lane_act0(lane);
+    return context;
+}
+
 // One 8-bit base-3 digit: literal match with PTQ1SimtDecodeAtom -- (uint8)(raw * 3^t)
 // truncation, then digit = ((uint16)q * 3) >> 8, mapped to {-1, 0, +1}.
 __device__ __forceinline__ float ptq1_digit(std::uint8_t raw, int trit) {
@@ -67,7 +104,8 @@ struct PTQ1LaneSlice {
     std::int32_t act0;
 };
 
-// Decode this lane's four weights of `group` from the row's base/high planes.
+// Decode this lane's four weights of `group` from the row's base/high planes. Used by the tile
+// and prefill kernels, which amortise the decode over several tokens.
 __device__ __forceinline__ PTQ1LaneSlice ptq1_lane_decode(const std::uint8_t* __restrict__ code_row,
                                                           const std::uint8_t* __restrict__ high_row,
                                                           int lane, int group) {
@@ -126,7 +164,8 @@ __device__ __forceinline__ float ptq1_lane_dot(const PTQ1LaneSlice& slice,
     return fmaf(slice.w0, low.x, fmaf(slice.w1, low.y, fmaf(slice.w2, high.x, slice.w3 * high.y)));
 }
 
-// T == 1 decode GEMV, PTQ1_0. One warp per output row, no __syncthreads.
+// T == 1 decode GEMV, PTQ1_0. One warp per output row, no __syncthreads, no divergent branch:
+// every lane runs the same sequence and the tail lanes differ only through their context.
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_ptq1_gemv_kernel(const __nv_bfloat16* __restrict__ x,
                               const std::uint8_t* __restrict__ codes,
@@ -146,11 +185,38 @@ void ternary_ptq1_gemv_kernel(const __nv_bfloat16* __restrict__ x,
     const std::uint8_t* scale_row =
         scales + static_cast<std::int64_t>(warp) * groups_per_row * kGemvScaleBytesPerGroup;
 
+    const PTQ1LaneContext context   = ptq1_lane_context(lane);
+    const __nv_bfloat16* lane_x     = x + context.act0;
+
     float accumulator = 0.0f;
     for (int group = 0; group < groups_per_row; ++group) {
-        const PTQ1LaneSlice slice = ptq1_lane_decode(code_row, high_row, lane, group);
-        accumulator = fmaf(gemv_scale(scale_row + group * kGemvScaleBytesPerGroup),
-                           ptq1_lane_dot(slice, x, group), accumulator);
+        // Every lane loads both words -- the code word at its valid in-group offset and the
+        // group's high pair -- and one select picks the tail lanes' source. Loading both keeps
+        // the body branch free and neither read leaves its group.
+        const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(
+            code_row + static_cast<std::int64_t>(group) * kPTQ1CodeBytes + context.code_off);
+        const std::uint32_t high_word = *reinterpret_cast<const std::uint16_t*>(
+            high_row + static_cast<std::int64_t>(group) * kPTQ1HighBytes);
+        const std::uint32_t packed = context.tail ? high_word : code_word;
+
+        const std::uint32_t t_lo =
+            ((__byte_perm(packed, 0u, 0x4140) * context.p_lo) & 0x00FF00FFu) * 3u >> 8;
+        const std::uint32_t t_hi =
+            ((__byte_perm(packed, 0u, context.sel_hi) * context.p_hi) & 0x00FF00FFu) * 3u >> 8;
+
+        const float w0 = static_cast<float>(t_lo & 0x3u) - 1.0f;
+        const float w1 = static_cast<float>((t_lo >> 16) & 0x3u) - 1.0f;
+        const float w2 = static_cast<float>(t_hi & 0x3u) - 1.0f;
+        const float w3 = static_cast<float>((t_hi >> 16) & 0x3u) - 1.0f;
+
+        const __nv_bfloat16* lane_base =
+            lane_x + static_cast<std::int64_t>(group) * kPTQ1GroupK;
+        const float2 low = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(lane_base));
+        const float2 high =
+            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(lane_base + 2));
+        const float dot = fmaf(w0, low.x, fmaf(w1, low.y, fmaf(w2, high.x, w3 * high.y)));
+        accumulator = fmaf(gemv_scale(scale_row + group * kGemvScaleBytesPerGroup), dot,
+                           accumulator);
     }
 
 #pragma unroll
