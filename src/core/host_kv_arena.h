@@ -265,7 +265,11 @@ private:
     [[nodiscard]] std::byte* allocation_data(const Descriptor& descriptor) const noexcept;
     void bump_revision() noexcept;
 
-    std::optional<PinnedHostBuffer> backing_;
+    // Prefers pinned memory and falls back to pageable when the lock is refused: the KVMem
+    // host tier is sized for the worst case (every page evicted), which at a long context
+    // exceeds what a process may pin. Pageable storage keeps the copies correct, just
+    // synchronous -- see HostBuffer.
+    std::optional<HostBuffer> backing_;
     std::size_t capacity_bytes_ = 0;
     std::size_t occupied_bytes_ = 0;
     std::vector<HostKVPageLayout> layouts_;

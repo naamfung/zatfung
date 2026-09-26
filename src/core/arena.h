@@ -108,6 +108,34 @@ private:
     std::size_t size_ = 0;
 };
 
+// Host-side buffer for allocations whose size is driven by the workload rather than by the
+// model. The KVMem host tier is sized for the worst case -- every page of the address space
+// evicted -- so at a long context it asks for more than a process is allowed to keep locked,
+// and a cudaMallocHost failure there would take the whole run down. This buffer prefers pinned
+// memory (it keeps the device copies genuinely asynchronous) and falls back to pageable memory
+// when the lock is refused. cudaMemcpyAsync stays correct on a pageable source or destination;
+// it only stops being asynchronous.
+class HostBuffer {
+public:
+    explicit HostBuffer(std::size_t size_bytes);
+    ~HostBuffer();
+
+    HostBuffer(const HostBuffer&)            = delete;
+    HostBuffer& operator=(const HostBuffer&) = delete;
+    HostBuffer(HostBuffer&& other) noexcept;
+    HostBuffer& operator=(HostBuffer&& other) noexcept;
+
+    void* data() const noexcept;
+    std::size_t size() const noexcept;
+    // False when the lock was refused and the storage is pageable.
+    [[nodiscard]] bool pinned() const noexcept;
+
+private:
+    void* data_       = nullptr;
+    std::size_t size_ = 0;
+    bool pinned_      = false;
+};
+
 using WorkspaceArena = DeviceArena;
 
 namespace core {

@@ -525,4 +525,70 @@ void* PinnedHostBuffer::data() const noexcept { return data_; }
 
 std::size_t PinnedHostBuffer::size() const noexcept { return size_; }
 
+HostBuffer::HostBuffer(std::size_t size_bytes) : size_(size_bytes) {
+    if (size_bytes == 0) { throw std::invalid_argument("HostBuffer size must be nonzero"); }
+
+    void* ptr = nullptr;
+    if (cudaMallocHost(&ptr, size_bytes) == cudaSuccess) {
+        pinned_ = true;
+    } else {
+        // The lock was refused -- a long-context host tier can ask for more than the process
+        // may pin. Clear the sticky error before the fallback so it cannot be mistaken for a
+        // later failure, and take ordinary pageable memory instead of failing the run.
+        (void)cudaGetLastError();
+        ptr = std::malloc(size_bytes);
+        if (ptr == nullptr) { throw std::bad_alloc(); }
+        pinned_ = false;
+        // Worth saying out loud: this is a real downgrade for whatever tier owns the buffer
+        // (its device copies become synchronous), and it is the difference between a long
+        // context fitting and not fitting.
+        std::fprintf(stderr,
+                     "WARN  host buffer is pageable, not pinned | %zu MiB requested | the "
+                     "process was refused that much locked memory; device copies of this "
+                     "buffer are no longer asynchronous\n",
+                     size_bytes >> 20);
+    }
+
+    data_ = ptr;
+}
+
+HostBuffer::~HostBuffer() {
+    if (pinned_) {
+        free_pinned(data_);
+    } else {
+        std::free(data_);
+    }
+}
+
+HostBuffer::HostBuffer(HostBuffer&& other) noexcept
+    : data_(other.data_), size_(other.size_), pinned_(other.pinned_) {
+    other.data_   = nullptr;
+    other.size_   = 0;
+    other.pinned_ = false;
+}
+
+HostBuffer& HostBuffer::operator=(HostBuffer&& other) noexcept {
+    if (this == &other) { return *this; }
+
+    if (pinned_) {
+        free_pinned(data_);
+    } else {
+        std::free(data_);
+    }
+    data_   = other.data_;
+    size_   = other.size_;
+    pinned_ = other.pinned_;
+
+    other.data_   = nullptr;
+    other.size_   = 0;
+    other.pinned_ = false;
+    return *this;
+}
+
+void* HostBuffer::data() const noexcept { return data_; }
+
+std::size_t HostBuffer::size() const noexcept { return size_; }
+
+bool HostBuffer::pinned() const noexcept { return pinned_; }
+
 } // namespace ninfer
