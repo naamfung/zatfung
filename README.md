@@ -1,12 +1,16 @@
-[![English](https://img.shields.io/badge/Language-English-2ea44f?style=flat-square)](README.md)
-[![简体中文](https://img.shields.io/badge/Language-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-d73a49?style=flat-square)](README.zh-CN.md)
+# zatfung — 疾风 (zat⁶ fung¹)
 
-# zatfung — 疾风 (zat6 fung1)
+**zatfung**（粤语 *zat⁶ fung¹*，疾风）是一个 CUDA 优先的 C++ 推理引擎，
+面向 Bonsai 2 27B 的两种三元权重格式 —— 真三元 `PTQ1_0_G128`（base-3 三进制打包，
+28 B/128 权重）与假三元 `PQ2_0_G128`（2 bit 码，34 B/128），派生自 NINFER 家族。
 
-> **zatfung**（粤语 *zat6 fung1*，疾风）是一个 CUDA 优先的 C++ 推理引擎，
-> 面向 Bonsai 2 27B 的两种三元权重格式 —— 真三元 `PTQ1_0_G128`（base-3 三进制打包，
-> 28 B/128 权重）与假三元 `PQ2_0_G128`（2 bit 码，34 B/128），派生自 NINFER 家族。
-> 一个源码树同时覆盖四档 NVIDIA 架构：
+在 NINFER 架构下，本 fork **首发并独立实现了 KVMem** —— 一套将 KV cache 从显存上限里
+解耦出来的分层记忆机制（设计同源于 llama.cpp 侧的 laamaafung，实现按本引擎的分页
+KV / block_table 架构完全重写）：设备显存只驻留一个小的工作集窗口，完整上下文分层到
+宿主内存，于是两种三元打包的 27B 模型能以**极限方式跑进 8 GB 级显卡** —— 本机
+3060 Ti 实测 256K 逻辑上下文（机制与配置见下文 KVMem 专节）。
+
+一个源码树同时覆盖四档 NVIDIA 架构：
 
 | `CMAKE_CUDA_ARCHITECTURES` | 架构 | 代表显卡 | 说明 |
 |---|---|---|---|
@@ -17,22 +21,47 @@
 
 四档都能全量构建，但**"能编译"不等于"能跑"**，验收程度并不相同：
 
-- `86`（本机 3060 Ti）已跑通构建 + 单测 + 端到端生成。
-- `75` 目前**只到编译层**：全量构建通过，MMA 与 warp 归约的 Turing 降级做过硬件级等价验证
-  （在 sm_86 上与被替换的指令逐位比对），但**尚无 2080 Ti 实机验收**；而且 prompt attention
-  的 tile 超出 Turing 每 block 64 KiB 的 opt-in 上限，在 2080 Ti 上首次调用即失败。
-  缺口清单、实测数据与后续步骤见
+- `86`（本机 3060 Ti）已跑通构建 + 全量单测（111/111）+ 端到端生成。
+- `75` 目前**只到编译层**：全量构建通过，MMA 与 warp 归约的 Turing 降级做过硬件级等价验证，
+  但尚无 2080 Ti 实机验收，且 prompt attention 的 tile 超出 Turing 每 block 64 KiB 的
+  opt-in 上限。缺口清单与后续步骤见
   [`docs/zatfung-sm86-sm75-port.md`](docs/zatfung-sm86-sm75-port.md) 第 8 节。
 
 > **构建入口是 `builder.go`** —— 一个 Go 写的生产标准构建器。它会自己探测并拼装
 > MSVC 环境（不依赖 `vcvars64.bat`），因此在 `cmd.exe` 被禁用、Visual Studio
-> 生成器找不到 `cl.exe` 的环境里依然能从零构建。详见 [构建](#构建)。
+> 生成器找不到 `cl.exe` 的环境里依然能从零构建。
 
 ---
 
-## 构建
+### 克隆指南
 
-```bash
+> **商业化声明（2026-09-28）**：本项目已转为商业项目，后续增强版本不再开源发布。
+> **`vD` 是唯一持续维护并公开的开源版本**；`vE` 已从远端删除，`vF` 及之后的分支为
+> 内部开发线、不再公开推送。外部用户请克隆 `vD`；`vF` 仅限内部访问。
+
+版本分支自 `master` 依次演进：`vA` → `vB` → `vC` → `vD` → `vE` → `vF`
+（vA–vC 为 KVMem 演进快照，vD 为前一验证线）。
+
+- **克隆公开开源线（vD，外部用户入口）**：
+  ```sh
+  git clone -b vD https://github.com/naamfung/zatfung.git
+  ```
+- **克隆内部开发线（vF，仅限内部访问）**：全量测试套件 111/111 全绿（sm_86 实测），
+  含 PTQ1_0 MMA prefill、解码诊断行等 vD 之后的能力：
+  ```sh
+  git clone -b vF <内部仓库地址>
+  ```
+
+---
+
+### 编译指南
+
+**工具链依赖**：Go 编译器（编译 builder 本身）、Visual Studio（MSVC C/C++ + Windows SDK）、
+CUDA Toolkit 12.x（nvcc）、Ninja；ccache 可选。
+
+**基本用法**（在仓库根目录执行）：
+
+```sh
 go build -o builder.exe builder.go     # 得到自包含的构建器
 ./builder.exe -list                    # 环境自检：GPU / CUDA / MSVC / SDK / Ninja / ccache
 ./builder.exe                          # 探测本机 GPU 架构并完整构建
@@ -40,799 +69,283 @@ go build -o builder.exe builder.go     # 得到自包含的构建器
 ./builder.exe -fresh                   # 全量重建；-keep 只重置 CMake 状态
 ```
 
-构建器的设计取舍与踩过的坑都写在 `builder.go` 的文件头注释里，最关键的几条：
+builder 内置了旧脚本踩过的全部坑的处理，最关键的几条：
 
-- **不依赖 `vcvars64.bat`**：本机 `cmd.exe` 被安全策略禁用，`call vcvars64.bat`
-  根本调不起来。构建器用 Go 直接探测 VS 安装 / MSVC 工具集 / Windows SDK 版本，
+- **不依赖 `vcvars64.bat`**：直接探测 VS 安装 / MSVC 工具集 / Windows SDK 版本，
   手工拼出等价的 `INCLUDE` / `LIB` / `PATH`，让 Ninja 生成器拿到可用的 `cl.exe`。
-- **默认 Ninja，不用 VS 生成器**：本机 CMake 用 Visual Studio 生成器会直接报
-  `No CMAKE_C_COMPILER could be found`（原因同上）。Ninja 还额外带来一个好处 ——
-  它是 Windows 上少数会真正执行 `CMAKE_CUDA_COMPILER_LAUNCHER` 的生成器。
-- **ccache 只挂 CUDA**：实测 ccache 包装本机本地化 MSVC 必崩（`cl.exe` 输出 GBK，
-  ccache 按 UTF-8 解析 → `Illegal byte sequence`），而包装 nvcc 完全正常且能命中。
+- **默认 Ninja，不用 VS 生成器**（换回 VS 生成器用 `-gen vs`）。
+- **ccache 只挂 CUDA**：包装本机本地化 MSVC 的 `cl.exe` 必崩，包装 nvcc 完全正常且能命中；
   CUDA 实例正是耗时大头。
-- **CUDA 版本逃生舱**：上游参考线硬要求 CUDA ≥ 13.1（服务 Blackwell）。75/86/89
-  三档用 CUDA 12.8 即可完整编译，构建器会在目标非 120a 时自动带上
-  `-DNINFER_ALLOW_LEGACY_CUDA=ON`，不必为一个策略性版本号去装新工具链。
+- **CUDA 版本逃生舱**：目标非 `120a` 时自动带上 `-DNINFER_ALLOW_LEGACY_CUDA=ON`，
+  75/86/89 三档用 CUDA 12.8 即可完整编译，不必为策略性版本号装新工具链。
 - **代理变量剥离**：`HTTP_PROXY` 等会让 MSBuild 报 `MSB6001`，子进程环境强制剥离。
 
-产物与运行时布局：编译出的 `ninfer.exe` / `ninfer-serve.exe` / `ninfer-perplexity.exe`
-会连同 `cudart64_*.dll`（以及存在时的 ffmpeg DLL）一起落位到构建目录根部，形成可直接运行的布局。
+**常用参数**：`-arch 75|86|89|120a|native|auto`、`-j N`（并行度）、`-gen ninja|vs`、
+`-target T1,T2`（只构建指定目标）、`-media auto|on|off`（媒体解码，无 ffmpeg 时自动转 stub）、
+`-D "<CMake 参数>"`（额外 CMake 参数，**须自带 `-D` 前缀**，如 `-D="-DBUILD_TESTING=ON"`）、
+`-C <dir>`（指定仓库根，用于 worktree 跨分支构建）。
+
+**构建目录与产物**：构建目录为 `build-SM<ARCH>`（多档可并存互不干扰），并在有
+git 的仓库里追加当前检出 —— 分支名（如 `build-SM86-vF`）或短哈希（detached 检出，
+如 `build-SM86-327372f`）—— 不同分支/提交的构建树因此天然分开，来回切换不必重建，
+配合共享 ccache 各自增量；无 `.git` 的分发包（GitHub ZIP）切不了分支，目录就是裸的
+`build-SM86`。`ninfer.exe` / `ninfer-serve.exe` / `ninfer-perplexity.exe` 连同
+`cudart64_*.dll`（以及存在时的 ffmpeg DLL）一起落位到构建目录根部，形成可直接运行
+的布局。每次构建结束自检产物齐全性，并自动清理构建目录树里不在落位路径上的过期同名副本
+（按三个产物名精确匹配，被占用的副本警告后留给下次构建）；编译日志见构建目录下的
+`builder-build.log` 与 `builder-configure.log`。
 
 ---
 
-> **本仓库是衍生作品，不是 NINFER 上游。** 横线以下是上游 README 原文，未作改动。
-> This repository is a derivative work. It is not upstream NINFER. Everything below the
-> horizontal rule is the upstream README, unchanged.
+### 测试指南
+
+带测试套件构建后用 ctest 运行（ctest 不由 builder 代跑）：
+
+```sh
+./builder.exe -arch 86 -D="-DBUILD_TESTING=ON"   # 带测试套件构建
+cd build-SM86-vF
+ctest --output-on-failure                        # 运行全部测试
+```
+
+- `vF` 全量 **111/111 通过**（sm_86，Windows 实测口径）。注册共 114 项：3 项 Disabled
+  （设计内，不计入统计分母），其余按架构能力 / 缺模型 Skip，无假失败。111 之外另有
+  3 项此前因 MSVC 编不过从未被 ctest 跑过（`1e9d57d` 起修复并跑绿）。
+- **按架构能力自动跳过**：FP8 MMA（sm_89/120）与 NVFP4 W4A4（仅 sm_120）专属测试臂
+  在低档架构上以 `SKIP(77)` 跳过；A16 反量化臂任何架构恒编译、恒运行。
+  能力宏（`NINFER_HAS_FP8_MMA` / `NINFER_HAS_NVFP4_MMA`）由 CMakeLists 按 tier 派生。
+- **real 系列测试**缺模型文件时 Skip；**媒体解码测试**仅在源码树提供
+  `ffmpeg/{include,lib}` 时注册（`NINFER_BUILD_MEDIA_ACQUIRE`，builder 缺 ffmpeg 时自动转 stub）。
+- 未运行的项目全部设计内（缺模型 / 缺工件 / 能力门控 / Disabled），无假失败。
 
 ---
 
-## What this is
+### 运行指南
 
-**NINFER** is a single-GPU C++20/CUDA inference engine. This branch takes the ternary (PQ2_0)
-quantization of Bonsai 2 27B and lands it on **NINFER**'s Ada line, adding the tensor-core paths
-the ternary format needs and measuring every change on a physical RTX 4070 Ti SUPER.
+构建目录根部即可直接运行：
 
-Ternary weights are packed `{−1, 0, +1}` at 2 bits per code plus one fp16 scale per 128-weight
-group. This is the ternary family usually called **1.58-bit** — that figure is log₂3, the
-information content of a ternary symbol — while the format as stored costs **2.125 bits per
-weight** once the codes and their group scales are counted. Both numbers are correct and they
-measure different things; the second one is what the memory system actually pays.
+```sh
+./ninfer-serve.exe <model>.ninfer \
+  --host 127.0.0.1 --port 8080 \
+  --max-context 131072 --kv-capacity auto --kv-dtype rk4v4-e8 \
+  --max-concurrency 2 --device-state-slots 2 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --prefill-chunk 2048
+```
 
-That is roughly half the weight traffic of a 4-bit format, which is the entire reason the numbers
-below are where they are: the model reads 7.12 GiB of weights per verify round, and the card reads
-at a measured 637 GB/s.
+- 在有多块 GPU 的机器上，用 `CUDA_VISIBLE_DEVICES` 指定序号（CUDA 的枚举顺序
+  未必与 `nvidia-smi` 一致）。`--max-context` / `--kv-capacity` / `--max-concurrency`
+  按显存与负载自行调。
+- 运行期 KV 量化（`--kv-dtype`）不改权重，公开的 `.ninfer` 产物可直接使用。
+- 完整选项契约见 [`docs/serving.md`](docs/serving.md)；CLI 用法见
+  [`docs/cli.md`](docs/cli.md)；性能与 PPL 评测见
+  [`docs/performance.md`](docs/performance.md) / [`docs/perplexity.md`](docs/perplexity.md)。
 
-| | |
+**长上下文与显存受限场景**：用下文的 KVMem —— 它把 KV cache 与显存上限解耦，
+是本 fork 在 NINFER 架构下首发并独立实现的机制，真假三元 27B 都适用。
+
+**Windows 提示**：存在 `--wddm-evictable-budget`（WDDM 驻留锁 + D3D12 共享堆），
+但它要求 GPU 不驱动桌面、仅 Windows 生效且不缩减权重占用，**不建议使用** ——
+长上下文的平台无关解法是下文的 KVMem。
+
+---
+
+### KVMem：把真假三元 27B 跑进 8 GB 显存
+
+KVMem（仅 `ninfer-serve`）解决一个具体的死结：不开它时，KV cache 必须按整个上下文
+驻留显存 —— 按实测口径（int8 KV 约 127 KiB/token，含 KV 平面之外的分配）外推，
+256K 上下文约需 32.6 GiB 显存，8 GB 卡不可能；假三元 PQ2_0 的文本权重又比真三元
+大 1.17 GiB（7.03 GiB vs 5.86 GiB），显存余量更小。
+
+它的做法是把「逻辑上下文」与「显存驻留」**解耦**：设备上只保留一个小页池作为
+常驻工作集，完整上下文的 KV 分层到宿主内存，窗口按需组装、换入换出 ——
+`--max-context` 因此只是逻辑上限，显存占用由池决定。四步机制（每步独立落地、带单测）：
+
+1. **窗口组装（纯宿主决策层）** —— `sink`（头部频段，抗注意力稀释）与 `recent`
+   （尾部，保生成连续）恒驻留；其余配额按检索 / 注意力双信号选块，选中块升序
+   **紧凑打包**成窗口，经 block_table 发布给注意力内核。槽位即位置，紧凑打包同时
+   减少了内核迭代量。
+2. **K 相位重铸（小 GPU 内核）** —— 打包改变了每个块的槽位，K 的 RoPE 相位必须
+   重铸：驻留块原地 re-RoPE，冷块从 raw-K 镜像重铸；remap 次数 / 位移双阈值触发
+   raw 重刷新，对抗 fp16 累积漂移。
+3. **prefill 分块映射** —— prompt 不一次映射入池，按块映射；某块末端将超出池时，
+   先把窗口外的页停到宿主再继续。
+4. **生成期回收** —— 输出把池跑满时按窗口换出、腾出 `--kvmem-gen-reserve` 的余量，
+   解码继续，不必为整个生成长度预留显存。
+
+代价与约束：KV 平面按 `int8-group64` 存储（重相与打分都经这个编解码器）；
+被回收的血脉不再命中兼容前缀缓存，下一轮重 prefill 而不是命中。
+
+本机实测（3060 Ti 8 GB）：
+
+| 配置 | 结果 |
 |---|---|
-| Engine | **NINFER** — v1.0.8 Ada line |
-| Weights | Ternary Bonsai 2 27B, `PQ2_0_G128` |
-| Hardware | RTX 4070 Ti SUPER (16 GiB, `sm_89`, 637 GB/s measured read ceiling) |
-| Toolchain | CUDA 13.4, GCC 15, Linux |
+| PTQ1_0，`--max-context 262144 --kv-device-tokens 10752 --kvmem --kvmem-budget 8192 --kvmem-gen-reserve 2048` | 256K 逻辑上下文落在 168 页设备池上，余 500 MiB；prefill 354 tok/s（1,459-token prompt，`--no-thinking`，分块 2048） |
+| PTQ1_0，池小于 prompt（`--kv-device-tokens 640`：10 页 vs prompt 需要的 21 页） | 三轮全部正确服务 |
+| **PQ2_0 假三元、仅文本极限配置**（无视觉 / MTP / DFlash，见下方命令） | **8 GB 启动成功并通过真实生成**：规划后 free 仅 22.0 MiB，整机显存 7612 MiB（含桌面 ~375 MiB）；短 prompt 生成 27.1 tok/s（21-token prompt、60-token 输出 ×3，CUDA Graph 开启口径，详下文速查表） |
 
-## Project lineage and credits
+KVMem 工作在 KV 侧、与权重打包格式正交：PTQ1_0（真三元）与 PQ2_0（假三元）的
+公开 `.ninfer` 产物都直接可用，无需重新转换。
 
-This work stands entirely on **NINFER** and the forks around it. In lineage order:
+配置启动（256K 极限配置，与上表 PTQ1_0 行同口径）：
 
-| Project | Contribution |
-|---|---|
-| **[Neroued/ninfer](https://github.com/Neroued/ninfer)** | **Canonical upstream NINFER** — C++20/CUDA architecture, DFlash2, ReplaySSM, Paged KV Cache. Apache-2.0. |
-| [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) | Original RTX 4090 fork; WDDM evictable-budget bypass and the E8-lattice `rk4v4-e8` KV storage |
-| [sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090) | Ada `sm_89` kernel optimizations, `rk4v4-e8` adaptation, GDN cooperative-launch fix |
-| [natpate/ninfer-windows](https://github.com/natpate/ninfer-windows) | Win32/MSVC portability layer, unbuffered async I/O |
-| [headpiece747/ninfer-5090-windows](https://github.com/headpiece747/ninfer-5090-windows) | Native Windows MSVC compilation base |
-| [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) | Ampere work and early compatibility bridges |
-| **[Ambolio/ninfer-4090-windows](https://github.com/Ambolio/ninfer-4090-windows)** | **The direct base of the source tree** — the Windows Ada line this branch's engine code starts from |
-
-Two of those are the direct inputs, and they deserve to be named before the rest:
-**[shensanshu/ninfer-ada-ternary](https://www.modelscope.cn/shensanshu/ninfer-ada-ternary)** on
-ModelScope (*"NInfer on Ada · 三元 Bonsai 2 27B 实战移植"*, Apache-2.0) is **the source of the ternary
-port itself** — its `patches/` are the engine-side changes, its `tools/` are the packer and the
-verification harness, and its `docs/` are the technical record. Ambolio's branch is where the engine
-source tree comes from.
-
-### Model weights — not distributed here
-
-The model is **Ternary Bonsai 2 27B**, built on `Qwen/Qwen3.8-27B` with the architecture unchanged
-and the weights quantized to ternary over a Hadamard-rotated basis. **Weight copyright belongs to
-its authors and publishers — PrismML and the upstream Qwen lineage — and this repository does not
-contain or redistribute any model weights.** Obtain them from the official channels and observe
-their own terms, which may not be Apache-2.0. A `.ninfer` artifact produced from them is a
-weight-derived work, so its redistribution obligations follow the *weight* licence, not this
-repository's.
-
-### Method references
-
-Ternary encode/decode semantics follow `ggml-quants.c` in the llama.cpp ecosystem. The folded
-Hadamard basis follows PrismML's published runtime and its `prism.hadamard.*` metadata contract.
-The tensor-core FWT design was informed by the public HadaCore and TurboQuant work. These are
-method references only; the code here is an independent implementation.
-
-The upstream `NOTICE` and `LICENSE` are retained verbatim. Every file this branch modifies carries a
-prominent notice at the top, as Apache-2.0 §4(b) requires.
-
-## What this branch changes
-
-Seven commits on top of the upstream baseline, each with its measurements in the message:
-
-- **Ternary tensor-core prefill path** — 6.8x over the blocked GEMV on the same weights, then
-  3.51x more from NCU-guided tuning (`prefill-3.2x`, `prefill-3.51x` tags).
-- **A small-T tensor-core path for the speculative verify pass.** The prefill kernel tiles the token
-  axis at 128, which is 97% empty at T=3; the verify path keeps all of K inside one CTA so the
-  weights are read exactly once for all drafted tokens. This is where most of the decode speed came
-  from, and it moved MTP from net-negative to net-positive.
-- **Two rounds of decode optimisation found by reading SASS**, not by reasoning: a ternary that the
-  compiler had emitted as both arms plus a SEL, and a bias prefix left over from an earlier magic
-  constant. Both are bit-identical in and out.
-- **Rotation launch packing** — the rotation is one warp per (K-block, token) pair, so its grid is
-  fixed by the data; the only free parameter is how those warps are packed, and at 8 per block a
-  decode-shaped rotation put 20 warps on 3 of 66 SMs.
-
-## Specification
-
-```
-Device      NVIDIA GeForce RTX 4070 Ti SUPER - 16 GB (16376 MiB) - sm_89 (Ada) - driver 615.71.09
-Model       Ternary Bonsai 2 27B - 2.125 bit per weight - native context ceiling 256k
-
-Decode      100.8 t/s      MTP draft 3, 300 tokens, en-code
-Prefill     1230  t/s      tensor-core path
-VRAM        7.12 GiB       weights, of which 0.42 GiB is the MTP layer (6.70 GiB without --spec)
-Context     120k tokens    bf16 KV, measured ceiling on 16 GB (128k will not start)
-            238k tokens    fp8 KV, measured ceiling (240k will not start)
-
-Long-context recall   6/6 at 16k/32k/64k/96k (bf16) - 6/6 at 128k/192k (fp8)
-                      (six-needle retrieval; 192k also 6/6 under two other query orders)
+```sh
+./ninfer-serve.exe <PrismML-PTQ1_0.model>.ninfer \
+  --host 127.0.0.1 --port 8080 \
+  --max-context 262144 --kv-dtype int8 \
+  --kvmem --kv-device-tokens 10752 \
+  --kvmem-budget 8192 --kvmem-gen-reserve 2048
 ```
 
-Every figure above is measured on this machine, not quoted. The context ceilings come from
-`--kv-capacity auto`, which sizes against VRAM and fails loudly when the request does not fit;
-the two numbers either side of each ceiling were both tried.
+**PQ2_0 假三元在 8 GB 卡上的极限配方**（不传 `--spec` / `--vision` 即不加载
+MTP / DFlash / 视觉权重，仅文本）：
 
-Note what the KV dtype buys: fp8 doubles the reachable context, and recall holds under it —
-128k and 192k both returned 6/6 with fp8 KV.
+```sh
+./ninfer-serve.exe <PrismML-PQ2_0.model>.ninfer \
+  --host 127.0.0.1 --port 8080 \
+  --max-context 262144 --kv-dtype int8 \
+  --kvmem --kvmem-budget 1024 --kv-device-tokens 2048 \
+  --kvmem-gen-reserve 256 --prefill-chunk 256 \
+  --max-concurrency 1 --device-state-slots 0
+```
 
-## Measured on this hardware
+每个旋钮都在换显存：窗口与池压到最小（1024/2048 token）、`--prefill-chunk 256`
+压激活、单并发零额外状态槽（每个额外的设备状态快照槽要 ~147 MiB，默认留一份，
+删掉即省回这一份）、CUDA Graph 保持默认开启 —— 它只要 12 MiB，
+换来 decode 约 +5%；显存极紧到 warmup 都过不去时才考虑 `--no-cuda-graph`。
+代价是吞吐与并发——这是"装得下"与"跑得动"之间的取舍。
 
-Decode, `en-code.json`, 300 tokens, MTP at draft 3, best of two passes with the engine's own
-acceptance accounting identical in every arm:
+**vD / vE 同口径对比**（同一台 3060 Ti、同一份 PQ2_0 仅文本极限配置、CUDA Graph
+开启、确定性请求（温度 0））：
 
-| Configuration | decode |
-|---|---:|
-| Speculative verify on the SIMT tile kernel | 43.2 t/s |
-| Verify on the small-T tensor-core path | 89.9 t/s |
-| + draft-window tuning and the SASS-driven decode work | 99.0 t/s |
-| + rotation launch packing, row-block reuse | **100.8 t/s** |
-
-Prefill: **1.23k t/s** on the tensor-core path (177 t/s blocked GEMV, 50 t/s on the reference
-kernel). Numerical equivalence against the reference prefill kernel holds to a PPL difference of
-0.015%.
-
-## What was tried and did not work
-
-Recorded here because the negative results took as long to establish as the positive ones, and
-three of them are structural rather than a matter of tuning:
-
-- Lowering the verify kernel's activation traffic by widening the row block. The load-mix argument
-  said activations were two thirds of the L2 traffic; dropping them by a third moved the effective
-  rate only from 453 to 480 GB/s against a 637 ceiling. The kernel is not L2-bandwidth-bound. The
-  0.45% it does buy is kept, on an engine A/B rather than on the theory.
-- Raising resident warps in the GDN record kernel. Occupancy was the obvious suspect at 16 of 48
-  warps; forcing registers down to fit 32 warps made it monotonically **slower**, twice. It is
-  limited by the serial recurrence over accepted tokens, not by residency.
-- Fusing the rotation calls. **NINFER** already does this — one rotation serves all four attention
-  projections, because the activation is the same width for all of them.
-
-The largest single line item, the verify pass at 13.3 ms against a 10.7 ms floor, has no lever I was
-able to find. It is not for lack of measuring: 80% of the throughput floor would need 117 t/s.
-
----
-
-# NInfer 4090 Windows
-
-> Windows port of NInfer for the NVIDIA GeForce RTX 4090 (`sm_89`, Ada Lovelace). Selected checkpoints. Maximum single-GPU inference performance. **100% Native Windows MSVC (no WSL2 required).**
-
-**[⬇️ Descargar versión precompilada portable v1.0.8 (Windows 11) en GitHub Releases](https://github.com/Ambolio/ninfer-4090-windows/releases/download/v1.0.8-windows/ninfer-4090-windows-v1.0.8.zip)**
-
-> 🖥️ **Companion repository (RTX 5090):** [Ambolio/ninfer-5090-windows](https://github.com/Ambolio/ninfer-5090-windows) — the Blackwell (`sm_120a`) sibling branch. Both repos publish the full two-card benchmark tables: see [Benchmarks — v1.0.7 cross-GPU campaign (2026-09-09)](#benchmarks--v107-cross-gpu-campaign-2026-09-09).
-
-NInfer 4090 Windows is a native Windows 11 port of the upstream
-[Neroued/ninfer](https://github.com/Neroued/ninfer) C++20/CUDA inference engine,
-adapted to the Ada Lovelace architecture (`sm_89`): kernels fitted to the
-48 KiB static shared-memory limit, the E8-lattice `rk4v4-e8` KV storage, MTP3
-and DFlash2 speculative decoding, and the WDDM evictable-budget bypass. It
-runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs.
-
-The performance numbers in this README were **measured with this build** on a
-physical RTX 4090 (section [Measured performance — this build](#measured-performance--this-build)).
-They are not upstream numbers.
-
----
-
-## Project Lineage & Credits
-
-This branch stands on the work of the whole NInfer Windows ecosystem. With
-gratitude to all of them — in lineage order:
-
-| Contributor | Repository | Contribution |
+| 口径 | vD | vE |
 |---|---|---|
-| **Neroued** | [Neroued/ninfer](https://github.com/Neroued/ninfer) | Canonical upstream: C++20/CUDA architecture, DFlash2, ReplaySSM, Paged KV Cache |
-| **UDPSendToFailed** | [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) | **Creator of the original RTX 4090 fork**; pioneer of the WDDM evictable-budget bypass on Windows WDDM and of E8 lattice (Conway-Sloane) geometric quantization, `rk4v4-e8` |
-| **sergiuszm** | [sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090) | Ada Lovelace `sm_89` kernel optimizations, `rk4v4-e8` adaptation, GDN cooperative-launch fix |
-| **natpate** | [natpate/ninfer-windows](https://github.com/natpate/ninfer-windows) | Base Win32/MSVC portability layer, unbuffered asynchronous I/O (`OVERLAPPED`), initial Windows scripts |
-| **headpiece747** | [headpiece747/ninfer-5090-windows](https://github.com/headpiece747/ninfer-5090-windows) | Native Windows MSVC compilation base from which this branch descends |
-| **Don-Chad** | [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) | Pioneering Ampere work and early compatibility bridges |
-| **dylanbrodiefafard** | [dylanbrodiefafard/ninfer](https://github.com/dylanbrodiefafard/ninfer) | v1.0.8 port: incremental host encode (`48d1857`) |
-| **nmorgowicz** | [nmorgowicz/ninfer-windows](https://github.com/nmorgowicz/ninfer-windows) | v1.0.8 port: `--tolerant-tool-calls` (`69b0950`) |
+| decode，60 token ×3 次 | 26.9 / 26.8 / 27.0 tok/s | 27.1 / 27.1 / 27.1 tok/s |
+| decode，300 token ×2 次 | 26.8 / 26.6 tok/s | 26.8 / 26.7 tok/s |
+| prefill，1,459 token | 375 tok/s | 375 tok/s |
 
-Model foundations: **Qwen Team (Alibaba Cloud)** for the foundational model
-architectures, **unsloth** for the NVFP4 quantizations, and **z-lab** for the
-DFlash companion weights.
+两版逐项打平（差异 ≤1%，测量噪声以内）：vE 相对 vD 无性能退化。
 
-This branch would not exist without that work. See [NOTICE](NOTICE) for the
-full legal attribution (Apache-2.0 §4) and third-party details.
 
 ---
 
-## Relationship to Upstream (v1.0.8)
+### 本机性能速查（vF，3060 Ti 8 GB）
 
-This branch tracks upstream `b88c0f6f` (v1.0.7: 7 commits post-v1.0.6 —
-MoE pipeline/prefetch/L2 ×3, NVFP4 W4A4 TMA, open-addressed BPE table,
-unicode NFC-skip, host-arena fix) plus the sm_89 layer, the post-merge
-correctness work of 2026-09-08 (int4-KV accumulator fix `6c4f5a10`,
-small-T T=7/8 port `f7cef9e9`+`486f647d`), and — new in v1.0.8 — five
-verified ports from the NInfer fork ecosystem (2026-09-09 forkscan, A/B'd
-against the v1.0.7 binaries on both cards before the deploy; see
-[Benchmarks — v1.0.7 cross-GPU campaign](#benchmarks--v107-cross-gpu-campaign-2026-09-09),
-subsection "v1.0.8 A/B on this baseline"):
+CUDA Graph 开启，确定性请求（temperature 0）。首字延迟 = 提交请求到收到第一个 token
+的时间。两种三元格式各按其 8 GB 配置实测，思维开/关两种口径：
 
-- **GDN gating pairwise-K** (sergiuszm `5d57fed`, sm_89): pairwise
-  K-reduction in the GDN gating-projection `MmaUnsplit` kernel. Resolves
-  the v1.0.7 borderline `gdn_gating_proj` test (ratio 1.212 → PASS).
-- **T=1 double-buffered Ada MMA** (UDPSendToFailed `39a6f20`, sm_89): the
-  T=1 draft head runs the double-buffered Ada MMA path.
-- **SM-count CTA sizing** (UDPSendToFailed `45a5ae5`, sm_89): CTA wave
-  sizes are derived from the target's SM count instead of an RTX 5090
-  constant (fixes oversized CTA waves on GPUs with fewer SMs).
-- **`--tolerant-tool-calls`** (nmorgowicz `69b0950`, frontend, both
-  cards): opt-in serve flag that keeps a complete Qwen tool call even when
-  trailing wrapper garbage follows (off by default; the strict parser
-  keeps its all-or-nothing behavior).
-- **Incremental host encode** (dylanbrodiefafard `48d1857`, frontend,
-  both cards): LRU cache of committed history prefixes with
-  loop-position splicing — unchanged history is re-encoded incrementally
-  instead of from scratch.
+**Q2 · PQ2_0 假三元，仅文本极限配置**（free 10 MiB，见上节配方）：
 
-### Shared with upstream
+| 场景 | 输入 | 输出 | 首字延迟 | 填充速度 | 生成速度 |
+|---|---|---|---|---|---|
+| 短问答 | 20 tok | 60 tok | 0.74 s | 27 tok/s | 27.1 tok/s |
+| 短文档摘要 | 511 tok | 63 tok | 1.40 s | 365 tok/s | 26.9 tok/s |
+| 中文档摘要 | 1,003 tok | 65 tok | 2.66 s | 377 tok/s | 26.8 tok/s |
+| 长文档摘要 | 1,459 tok | 74 tok | 3.89 s | 375 tok/s | 26.7 tok/s |
+| 长输出创作 | 21 tok | 300 tok | 0.43 s | 49 tok/s | 26.7 tok/s |
 
-- High-performance C++20/CUDA core and 1:1 compatibility with `.ninfer` artifacts.
-- MTP3, DFlash2 (`--spec dflash2 --draft-tokens 7`) and DFlash legacy
-  (`K=1..15`) speculative decoding, with transactional ReplaySSM for linear
-  GDN states.
-- HTTP APIs compatible with OpenAI Chat Completions / Responses and Anthropic
-  Messages, including streaming, tools, and token counting.
-- Low-latency prefix caching with paged Device/Host KV and State retention.
+**Q2 · 同配置，开思维（默认模板）**：
 
-### Added by this fork
+| 场景 | 输入 | 输出 | 首字延迟 | 填充速度 | 生成速度 |
+|---|---|---|---|---|---|
+| 短问答 | 60 tok | 60 tok | 1.26 s | 48 tok/s | 27.1 tok/s |
+| 短文档摘要 | 551 tok | 128 tok | 1.90 s | 290 tok/s | 26.9 tok/s |
+| 中文档摘要 | 1,043 tok | 128 tok | 2.88 s | 362 tok/s | 26.8 tok/s |
+| 长文档摘要 | 1,499 tok | 125 tok | 3.87 s | 387 tok/s | 26.5 tok/s |
+| 长输出创作 | 61 tok | 300 tok | 1.02 s | 60 tok/s | 26.7 tok/s |
 
-- **Native Windows 11 compilation**: CMake + MSVC 2022 + Ninja + CUDA 13.x —
-  no WSL2, no virtualization overhead (`build_windows.bat`, `build_v1.0.8.bat`).
-- **WDDM bypass (`--wddm-evictable-budget`)**: D3D12/DXGI residency lock that
-  budgets runtime memory against total VRAM instead of the WDDM process
-  budget, recovering 1.0–1.5 GB of physically retained VRAM (see
-  [Windows WDDM note](#windows-wddm-and-dedicated-gpus)). Concept pioneered
-  in [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090).
-- **Ada Lovelace adaptations (sm_89 only)**:
-  - Kernels adapted to the **48 KiB static shared-memory** limit (static
-    schedules ≤48 KiB; dynamic `extern __shared__` with 101,376 B opt-in for
-    larger tiles).
-  - Integration of **`rk4v4-e8`** (real 4-bit quantization over Conway-Sloane
-    E8 lattices) as a KV cache storage.
-  - MTP3 profile on Qwen3.6-35B-A3B.
+**Q1 · PTQ1_0 真三元，宽配置**（free 744 MiB：更大的池与窗口、默认状态槽）：
 
-### Verified in v1.0.6 (this branch)
+| 场景 | 输入 | 输出 | 首字延迟 | 填充速度 | 生成速度 |
+|---|---|---|---|---|---|
+| 短问答 | 20 tok | 60 tok | 1.05 s | 19 tok/s | 23.3 tok/s |
+| 短文档摘要 | 511 tok | 63 tok | 1.83 s | 280 tok/s | 23.2 tok/s |
+| 中文档摘要 | 1,003 tok | 65 tok | 3.15 s | 318 tok/s | 23.2 tok/s |
+| 长文档摘要 | 1,459 tok | 72 tok | 4.51 s | 324 tok/s | 23.0 tok/s |
+| 长输出创作 | 21 tok | 300 tok | 0.66 s | 32 tok/s | 23.1 tok/s |
 
-- int4-KV correctness: 27B +6.8% vs v1.0.5 (119.4 tok/s, A/B on this
-  hardware, commit `6c4f5a10`), outputs coherent across all int4 KV storages.
-- Test suite `ninfer_softmax_attention_test --dflash2-only`: 100% pass on
-  bf16/fp8/nvfp4/k8v4 (widths 2..16); the pre-port baseline crashed on W=7.
-- **DFlash2 end-to-end on sm_89**: 27B + dflash2 (7 draft tokens) measured at
-  104.1 tok/s decode, 28.5% draft acceptance — the e2e item pending since the
-  v1.0.6 port is now closed (see
-  [Measured performance — this build](#measured-performance--this-build)).
-- 260,032-token `rk4v4-e8` KV pool at C=4 with the WDDM budget, 96% of the
-  24 GB card resident (measured, not estimated).
-- **v1.0.7 test suite on Windows (2026-09-09)**: 103/104 green — 7 skipped
-  by-design (real-data + sm_89-only cases), 1 documented pre-existing
-  borderline (gdn_gating_proj T=4097, deterministic), 2 excluded on Windows
-  (BEX64 0xC0000409 in the MSVC test binaries — not the engine: the v1.0.7
-  server with real production data (150k-merge tokenizer, 260k profile)
-  boots and serves clean, verified with a :8091 smoke).
-- **v1.0.8 test suite on Windows (2026-09-09)**: 104/104 executed green
-  (407 s) — the v1.0.7 borderline `gdn_gating_proj` (T=4097, ratio 1.212)
-  now PASSES with the pairwise-K port; 7 skipped by-design (same as
-  v1.0.7); 3 excluded on Windows (`frontend_test`, `softmax_attention_test`,
-  `incremental_encode_test` — BEX64 0xC0000409 in the MSVC test binaries,
-  zero output at startup: a test-binary artifact, not the engine; the
-  v1.0.8 server with real production data boots and serves clean,
-  verified with production-artifact smokes).
+**Q1 · 同配置，开思维（默认模板）**：
 
-Details and A/B measurements: [PORT_v1.0.6.md](PORT_v1.0.6.md).
+| 场景 | 输入 | 输出 | 首字延迟 | 填充速度 | 生成速度 |
+|---|---|---|---|---|---|
+| 短问答 | 60 tok | 60 tok | 1.85 s | 32 tok/s | 23.1 tok/s |
+| 短文档摘要 | 551 tok | 128 tok | 2.56 s | 215 tok/s | 23.1 tok/s |
+| 中文档摘要 | 1,043 tok | 123 tok | 3.51 s | 297 tok/s | 22.9 tok/s |
+| 长文档摘要 | 1,499 tok | 128 tok | 4.54 s | 330 tok/s | 22.8 tok/s |
+| 长输出创作 | 61 tok | 300 tok | 1.59 s | 38 tok/s | 22.8 tok/s |
+
+- **思维模板的行为**：开思维后 chat 模板在 prompt 前后追加约 40 token（上表输入列
+  含模板），首字延迟随之略增；每 token 的生成速率与关思维完全一致 —— 思维只是
+  把预算花在思考 token 上，不改变 decode 内核的吞吐。开启后输出几乎总是耗尽
+  `max_tokens`（finish=length），需要完整答案时记得调大输出预算。
+- 短 prompt 的填充速率含固定开销（`--prefill-chunk 256` 的固定开销在小 prompt 上
+  占比更高），参考意义在长 prompt 梯度：0.5k → 1.5k 上 Q2 稳定在 362–387 tok/s、
+  Q1 稳定在 215–330 tok/s。
+- 生成速度两种格式、思维开/关都与输入输出长度基本无关：Q2 **26.5–27.1 tok/s**、
+  Q1 **23.0–23.9 tok/s**（差约 14%，来自 base-3 解码的额外指令）。
+- 对照说明：上游同模型在 RTX 4070 Ti SUPER（sm_89）记录 decode 100.8 t/s（MTP
+  draft 3）—— 本机 8 GB 极限配置不加载 MTP/DFlash，且架构低两档，两口径不可直接比较。
+- **Q1/Q2 权衡**：Q1 省 1.17 GiB 显存（free 744 MiB，可开更大的池与窗口），代价是
+  填充 -15%、生成 -14%；Q2 把显存用到只剩 10 MiB 换全速。MMA prefill 路径两种格式
+  都已具备（Q1 的实现见
+  [`docs/ptq1-prefill-mma-design.md`](docs/ptq1-prefill-mma-design.md)）；Q1 的解码
+  热路径还带一张每 CTA 的 base-3 数字查找表（值与算术解码逐位一致）。
 
 ---
 
-## Windows WDDM and dedicated GPUs
+### 模型下载（template-fetch）
 
-**If your GPU is dedicated, enable `--wddm-evictable-budget` to use its VRAM
-to the maximum.** On Windows, the WDDM driver model gives every process a
-memory *budget* that is a fraction of total VRAM (the OS holds back the rest
-for the display compositor and TDR recovery), and a process that exceeds its
-budget gets evicted or fails to commit. NInfer on Windows can instead take a
-D3D12/DXGI residency lock and budget against **total VRAM**:
+`tools/template-fetch` 从 HuggingFace **只下载 3.11 GiB**，自建 `pack_zatfung.py`
+所需的 19.03 GiB 模板 artifact —— 模板里 771 个 `text/*` 对象由打包器自己生成、从不读取，
+真正需要的 419 个对象（vision 333 + dflash2 66 + mtp 12 + frontend 6 + text/draft_head 2）
+恰好集中在文件两端，用 HTTP Range 取两段即可（省 83.6%）：
 
-- With the flag, this build ran the 35B-A3B profile with **23,651 MiB
-  resident of 24,564 MiB (96%)** — 20.6 GiB weights + a 260,032-token
-  `rk4v4-e8` KV pool + 8 GiB pinned host KV, at C=4. Without the flag the
-  same configuration does not start on a 24 GB card.
-- The flag is safe: if a real GPU memory pressure event happens (e.g. a
-  fullscreen game, another CUDA process), WDDM still evicts safely — the
-  budget just moves from "a fraction of VRAM" to "VRAM minus the hard
-  reserves".
-- If you still cannot start the server, lower `--max-context` /
-  `--kv-capacity` (or use `--kv-capacity auto`) until startup fits.
-
-The flag is a no-op safety net on multi-GPU systems: pair it with
-`CUDA_VISIBLE_DEVICES=<index>` to pin the engine to your card.
-
----
-
-## Measured performance — this build
-
-Measured **2026-09-08 on a physical RTX 4090 (24 GB, `sm_89`)** with the
-pre-compiled binary of this branch, `--wddm-evictable-budget` enabled, single
-stream, temperature 0.7. Prefill prompts are deterministic (~12.7k and
-~56.3k tokens); decode is one 2,048-token free generation. Timings are the
-ones the server itself reports (`prompt_per_second`,
-`predicted_per_second`); VRAM is `nvidia-smi` on the 4090.
-
-| Profile | Weights | KV pool (resolved) | Prefill 12.7k tok | Prefill 56.3k tok | Decode 2048 tok | Draft acceptance | VRAM peak |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Qwen3.6-35B-A3B — `rk4v4-e8`, MTP3 d3, C=4, 260k ctx | 20.6 GiB | 260,032 tok (explicit) | **10,916 tok/s** (TTFT 1.2 s) | **9,745 tok/s** (TTFT 5.8 s) | **391.4 tok/s** | 52.8 % (1,254/2,377) | 23,651 MiB (96 %) |
-| Qwen3.8-27B — `rk4v4-e8`, MTP3 d3, C=2, 131k ctx | 16.7 GiB | 262,144 tok (auto) | **2,143 tok/s** (TTFT 6.0 s) | **1,910 tok/s** (TTFT 29.5 s) | **97.8 tok/s** | 37.7 % (1,086/2,880) | 23,001 MiB (94 %) |
-| Qwen3.8-27B DFlash2 — `rk4v4-e8`, dflash2 d7, C=2, 131k ctx | 18.3 GiB | 138,752 tok (auto) | **2,079 tok/s** (TTFT 6.2 s) | **1,857 tok/s** (TTFT 30.4 s) | **104.1 tok/s** | 28.5 % (1,362/4,780, 7 tok) | 22,497 MiB (92 %) |
-
-Engine startup (weights load + CUDA graphs): 10.5 s / 9.2 s / 10.1 s
-respectively.
-
-Reading the table:
-
-- **35B-A3B vs 27B**: Qwen3.6-35B-A3B is a MoE with ~3B active parameters, so
-  on the same 4090 it prefills ~5× and decodes ~4× faster than the dense
-  Qwen3.8-27B. Pick it when your workload fits a single 24 GB card.
-- **DFlash2 vs MTP3 on 27B**: 104.1 vs 97.8 tok/s (+6.6%). DFlash2 (7-token
-  drafts, 28.5 % per-draft acceptance) beats MTP3 (3-token drafts, 37.7 %)
-  on this hardware — and this is the first end-to-end DFlash2 measurement on
-  `sm_89` (the item left open by the v1.0.6 port).
-- **v1.0.5 → v1.0.6 (A/B on this 4090, 27B, e8 KV)**: 111.8 → 119.4 tok/s
-  (**+6.8 %**), entirely from the int4-KV accumulator fix `6c4f5a10`.
-- **`--kv-capacity auto`** resolved 262,144 tokens for 27B and 138,752 for
-  27B-DFlash2 on 24 GB — DFlash2 keeps more draft state, hence the smaller
-  pool. All of this is only possible with the WDDM budget; without the flag
-  none of the three profiles would start at these capacities.
-
-All model artifacts are published by Neroued. The base
-[`qwen3_8_27b.ninfer`](https://huggingface.co/neroued/Qwen3.8-27B-NInfer)
-artifact used above is public and works with `--kv-dtype rk4v4-e8`
-(runtime KV quantization). The DFlash2 artifact
-(`qwen3_8_27b_dflash2.ninfer`) is the same public base weights with the
-DFlash companion merged in via the upstream converter pipeline; as of
-2026-09-08 the merged artifact is not yet published in Neroued's public
-HuggingFace repos (verified across all of his public NInfer repos).
-
----
-
-## Comparison with the upstream repository
-
-The upstream project publishes RTX **5090** reference numbers
-(docs/performance, v1.0.6, revision `487f8977`, INT8 group-64 KV, auto
-capacity). Our build is the same engine core + the sm_89/WDDM layer above, so
-the comparison below is *our measured 4090 numbers vs upstream's published
-5090 numbers*:
-
-| Metric (single stream) | Upstream 5090 (published) | This build — 4090 (measured) | Ratio |
-|---|---:|---:|---:|
-| 35B-A3B prefill ~8k tok (INT8 g64 KV) | 17,705 tok/s | 10,916 tok/s (12.7k tok, `rk4v4-e8`) | **62 %** |
-| 35B-A3B MTP3 decode C1 | 642.5 tok/s (68.6 % accept) | 391.4 tok/s (52.8 % accept) | **61 %** |
-| 27B prefill ~8k tok (INT8 g64 KV) | 3,275 tok/s (Qwen3.8-27B g64) | 2,143 tok/s (12.8k tok, `rk4v4-e8`) | **65 %** |
-| 27B MTP3 decode (upstream row is structured output) | 224.4 tok/s (structured) | 97.8 tok/s (free generation, 37.7 % accept) | 44 % |
-
-Honest caveats — the ratio is *not* a pure port-quality number:
-
-1. **Hardware**: Ada Lovelace `sm_89` (24 GB) vs Blackwell `sm_120a` (32 GB).
-   60–65 % of the 5090 prefill rate on the 4090 is exactly what the
-   generation gap implies; the port itself adds no measurable overhead.
-2. **KV dtype**: upstream published tables use INT8 group-64; our runs use
-   `rk4v4-e8` (E8-lattice 4-bit), which trades a little accuracy for
-   ~2× KV capacity.
-3. **Artifacts & acceptance**: draft acceptance depends on the MTP/dflash2
-   head baked into the *artifact* and on the prompt content, not on the
-   runtime. Our runs used locally quantized artifacts (35B-A3B v2; 27B +
-   DFlash2) on free-form generation, while the upstream rows use the public
-   artifacts (and, for the 27B decode row, a structured-output scenario).
-   That gap is why the decode ratio reads lower than the prefill ratio. To
-   isolate the port itself, the like-for-like structured MTP3 point was
-   measured on the 5090 (see the
-   [ninfer-5090-windows](https://github.com/Ambolio/ninfer-5090-windows)
-   README): Windows 5090 g64 structured = 237.6 tok/s = **106 %** of the same
-   upstream 224.4 tok/s point — so the 44 % above is hardware + quantization
-   + scenario, not the Windows port.
-4. **Concurrency**: upstream's C4 35B number (1,213.5 tok/s) is *aggregate*
-   over four concurrent streams; our 391.4 tok/s is a single stream on a
-   C=4 server (no batching benefit with one request).
-
-Within the *same* hardware, the port's effect is measured separately: the
-v1.0.5 → v1.0.6 A/B on this 4090 is **+6.8 %** (int4-KV fix).
-
----
-
-## Benchmarks — v1.0.7 cross-GPU campaign (2026-09-09)
-
-Measured **2026-09-09** in a single back-to-back campaign on one dual-GPU
-machine (Windows 11): the **RTX 4090 (24 GB, `sm_89`)** and the **RTX 5090
-(32 GB, `sm_120a`)** — the v1.0.7 binaries (sha256-verified byte-identical to
-the production binaries), `--wddm-evictable-budget` on every server, and the
-exact per-run argv recorded in each point JSON. Same artifacts, same harness,
-same day on both cards.
-
-> 🖥️ **Sibling repositories:** the full per-card data — methodology,
-> deviations registry (D1–D11), raw point JSONs and campaign logs — live in
-> both [Ambolio/ninfer-4090-windows](https://github.com/Ambolio/ninfer-4090-windows)
-> and [Ambolio/ninfer-5090-windows](https://github.com/Ambolio/ninfer-5090-windows).
-> This section is identical in both repos on purpose, so each page shows the
-> numbers for *both* cards.
-
-**Artifacts used in this campaign** (public HuggingFace repos, by Neroued):
-
-| Artifact | Weights | HuggingFace | Used for |
-|---|---|---|---|
-| `qwen3_6_35b_a3bv2.ninfer` — Qwen3.6-35B-A3B v2 | groupwise-int, 20.6 GiB | [Qwen3.6-35B-A3B-NInfer](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | S3 + P0 — both cards |
-| `qwen3_8_27b_nvfp4.ninfer` — Qwen3.8-27B | nvfp4, 21.5 GB | [Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | N0 + NS — 5090 |
-| `qwen3_8_27b.ninfer` — Qwen3.8-27B | groupwise-int, 16.7 GiB | [Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | NS — 4090 |
-
-(The 35B-A3B "v2" is the current production conversion of the public
-Qwen3.6-35B-A3B family; the 27B rows use the two public 27B conversions —
-NVFP4 on the 32 GB card, groupwise-int on the 24 GB card.)
-
-### S3 — 35B-A3B v2, MTP3 d3, saturated decode (both cards)
-
-Stochastic 8,192-token generation per request (293-token prompt), at
-concurrency C = 1/2/4/8; int8 KV, `auto` capacity. Steady-state committed
-decode rate:
-
-| C | 4090 — steady (tok/s) | 5090 — steady (tok/s) | 5090 / 4090 |
-|---:|---:|---:|---:|
-| 1 | 459.5 | 672.9 | **1.46×** |
-| 2 | 660.7 | 974.3 | **1.47×** |
-| 4 | 914.3 | 1,336.4 | **1.46×** |
-| 8 | 1,095.5 ¹ | 1,544.5 | **1.41×** |
-
-Draft acceptance: 4090 67.0–71.1 % · 5090 66.3–68.6 % — 8/8 real concurrent
-requests on both cards.
-
-¹ **24 GB wall with int8:** the `auto` pool on the 4090 resolves 59,648
-tokens < the 8×8,485 needed for C=8, so that point re-ran with the documented
-ladder `--kv-dtype rk4v4-e8 --kv-capacity 131072` (E8-lattice KV, 748 MiB
-pool) — still 8/8 real, mean batch 8.0. The 5090 resolves the full
-131,072-token pool with int8 `auto` in 32 GB.
-
-### NS — 27B, MTP3 d3, saturated decode (both cards)
-
-Same protocol (335-token prompt + 8,192 decode); int8 `auto` KV pools of
-16,384 / 32,768 / 65,536 / 113,216 (4090) and 16,384 / 32,768 / 65,536 /
-131,072 (5090):
-
-| C | 4090 — steady (tok/s) | 5090 — steady (tok/s) | 5090 / 4090 |
-|---:|---:|---:|---:|
-| 1 | 108.5 | 148.1 | 1.37× |
-| 2 | 164.6 | 281.2 | 1.71× |
-| 4 | 185.9 | 491.8 | 2.65× |
-| 8 | 290.5 | 827.5 | 2.85× |
-
-Draft acceptance: 4090 46.1–47.9 % · 5090 44.9–46.2 %.
-
-⚠ **Not like-for-like:** the 4090 ran the **groupwise-int** 27B artifact
-(16.7 GiB) and the 5090 the **NVFP4** one (21.5 GB), so the widening ratio
-(1.37× → 2.85×) is hardware *plus* weight quantization — NVFP4 reads fewer
-bytes per token, and the gap grows with concurrency. The S3 table above is
-the same-artifact comparison: ~1.45× with the identical 35B-A3B v2 on both
-cards.
-
-### P0 — 35B-A3B v2, MTP0 (no speculation), NIAH context corpus (both cards)
-
-20 serial requests = 5 seeds × {8k, 64k, 128k, 256k} contexts
-(2,311,680 prompt tokens total). Prefill and decode rates per context point:
-
-| Context (tok) | 4090 prefill | 5090 prefill | 4090 TTFT | 5090 TTFT | 4090 decode | 5090 decode |
-|---:|---:|---:|---:|---:|---:|---:|
-| 7,680 | 12,375.1 | 18,699.8 | 624 ms | 414 ms | 240.7 | 363.9 |
-| 64,512 | 9,418.1 | 12,092.7 | 6,875 ms | 5,363 ms | 202.2 | 317.9 |
-| 130,048 | 7,193.4 | 8,417.1 | 18,127 ms | 15,503 ms | 173.2 | 278.2 |
-| 260,096 | 4,927.2 | 5,261.9 | 52,884 ms | 49,530 ms | 136.3 | 225.5 |
-
-(prefill/decode in tok/s; full-corpus makespan: 4090 **393.9 s** · 5090
-**355.3 s**.)
-
-### N0 — 27B NVFP4, MTP0, NIAH context (5090 only)
-
-| Context (tok) | Prefill (tok/s) | TTFT (ms) | Decode (tok/s) |
-|---:|---:|---:|---:|
-| 7,680 | 9,780.6 | 789 | 75.9 |
-| 64,512 | 5,778.1 | 11,190 | 69.6 |
-| 130,048 | 3,866.0 | 33,692 | 63.7 |
-| 260,096 | 2,331.6 | 111,650 | 54.6 |
-
-(The 27B context point ran on the 5090 only — the 4090 27B context run was
-outside the campaign's fast profile; its 27B decode-saturation point is the
-4090 column of the NS table.)
-
-### Windows vs upstream Linux parity (same card)
-
-The point of the campaign: same models, same commands, same GPU — the
-measured delta is the overhead of the Windows port (WDDM), nothing else.
-
-- **RTX 5090 — parity.** Windows matches or slightly exceeds the numbers
-  upstream published for the same card, across every point of this campaign:
-  S3 steady 104.7–111.9 % of upstream, NS steady 103.0–107.9 %, P0 prefill
-  100.3–105.6 %, P0 decode 105.9–107.6 %, N0 prefill 105.9–117.3 %.
-- **RTX 5090 — structured MTP3 decode (follow-up, same day).** The upstream
-  "Structured" single-stream point, re-measured like-for-like on this build
-  (same 15-request corpus = 3 structured scenarios × 5 fixed seeds, same
-  server flags): g64 **237.6 ± 16.8 tok/s @ 87.5 %** vs upstream
-  224.4 ± 13.6 @ 89.5 % → **106 %**; NVFP4 **233.8 ± 10.8 @ 89.5 %** vs
-  219.8 ± 8.6 @ 90.8 % → **106 %** (see "Comparison with the upstream
-  repository" above).
-- **RTX 4090 — 38–79 % of the upstream *5090* reference** (S3 71.5–79.3 %,
-  NS 37.9–75.4 % — with the quantization caveat above —, P0 63.5–93.9 %):
-  that is the Ada-vs-Blackwell hardware gap, not port overhead. Within the
-  same hardware the port sits at parity (100–117 % on the 5090; the 4090's
-  own v1.0.5 → v1.0.6 A/B — int4-KV fix — measured +6.8 %).
-
-### Validation (same campaign)
-
-- **4090:** full ctest suite on the v1.0.7 build — 106/109 passed (3
-  documented failures: 2 = MSVC test-binary artifact `0xC0000409`, 1 = known
-  deterministic borderline; the v1.0.7 server with real production data
-  boots and serves clean, :8091 smoke) + 7 skipped by design. pytest
-  75 passed / 3 skipped / 1 failed — the single failure is a Windows
-  path-separator artifact in a converter test (`endswith("/model")`), not
-  port logic.
-- **5090:** ctest pass covered by the 4090 run (byte-identical trees); the
-  v1.0.7 5090 deployment additionally validated its suite 103/103 executed
-  green (1 `DISABLED` on Windows — the BEX64 test-binary artifact, engine
-  verified clean with a production-artifact smoke). pytest 75/3/1 (same
-  path-separator artifact).
-
-### v1.0.8 A/B on this baseline (2026-09-09)
-
-v1.0.8 = v1.0.7 + the five fork ports listed in
-[Relationship to Upstream](#relationship-to-upstream-v108) (the three
-sm_89 kernel ports apply to the 4090; the two frontend ports apply to both
-cards). Same machine, same day, same like-for-like protocol as the campaign
-above, A/B'd against the v1.0.7 binaries before the v1.0.8 deploy:
-
-| Point (steady decode tok/s; P0 = NIAH 262,144 makespan in s, lower = better) | 4090 v1.0.7 | 4090 v1.0.8 | 5090 v1.0.7 | 5090 v1.0.8 |
-|---|---:|---:|---:|---:|
-| S3 35B C1 (int8 auto) | 459.5 | 459.0 | 672.9 | 671.9 |
-| S3 35B C2 (int8 auto) | 660.7 | **680.2** | 974.3 | 972.5 |
-| S3 35B C4 (int8 auto) | 914.3 | 918.4 | 1,336.4 | 1,334.4 |
-| S3 35B C8 (4090: prod shape `rk4v4-e8` 131,072 · 5090: int8 auto) | 1,095.5 | 1,099.0 | 1,544.5 | 1,530.7 |
-| P0 35B NIAH makespan (s) | 393.91 | 394.82 | 355.28 | 355.83 |
-| NS 27B C1 (4090 `groupwise-int` / 5090 `nvfp4`; see the NS caveats) | 108.5 | 108.5 | 148.1 | 147.7 |
-| NS 27B C2 | 164.6 | 159.2 ¹ | 281.2 | 280.0 |
-| NS 27B C4 | 185.9 | 183.6 | 491.8 | 495.4 |
-| NS 27B C8 | 290.5 | 289.8 | 827.5 | 830.9 |
-
-**Verdict: no regression on any point (±1 %).** The 35B gains +3 % at C=2
-on the 4090, the production shape (C8 `rk4v4-e8`) is stable, and the 5090
-is pure parity — its v1.0.8 delta is frontend-only, which is exactly the
-expected result.
-
-¹ borderline noise band on the 4090 27B reference point (morning v1.0.7
-baseline vs evening v1.0.8; the 27B runs on the 4090 only as a standby
-reference, not production; the 27B matrix decode stayed flat at
-−0.1…−0.9 % on the same day).
-
----
-
-## Running the server
-
-### Generic startup (shipped as `start_4090.bat`)
-
-Minimal configuration — adjust `--max-context`, `--kv-capacity` and
-`--max-concurrency` to your VRAM and workload:
-
-```bat
-@echo off
-set CUDA_VISIBLE_DEVICES=0
-ninfer-serve.exe qwen3_6_35b_a3b.ninfer ^
- --host 127.0.0.1 --port 8080 ^
- --max-context 131072 --kv-capacity auto --kv-dtype rk4v4-e8 ^
- --wddm-evictable-budget --max-concurrency 2 --device-state-slots 2 ^
- --spec mtp --draft-tokens 3 --lm-head-draft ^
- --prefill-chunk 2048
-pause
+```sh
+cd tools/template-fetch
+go build -o template-fetch.exe main.go
+./template-fetch.exe                              # 默认：下载并产出可直接使用的完整模板
+./template-fetch.exe -out D:\tpl\qwen3_8_27b_v2.ninfer   # 指定输出路径
+./template-fetch.exe -j 8                         # 并发块数（默认 4）
 ```
 
-### Flag notes
+- **两种输出模式**：默认产出完整模板（可直接使用，中间 15.92 GiB 区段留零）；
+  `-slim` 只产出 3.11 GiB 的 extract（需自行还原）。
+- **可靠性**：显式要求 `206 Partial Content`（服务端忽略 Range 即报错）；
+  断点续传（`<out>.tplfetch.json`，中断重跑接着下）；全量 SHA-256 校验。
+- **revision 固定**：URL 钉在 `dc370fb6295a`（v2 容器）。HF 上的 `main` 已换成 v3
+  artifact，与本引擎的 v2 读取器不兼容 —— 程序会 HEAD 比对 `Content-Length`，
+  源文件被替换时直接报错而不是产出坏模板。
 
-- `--kv-dtype rk4v4-e8` is the E8-lattice 4-bit KV storage (sm_89 branch).
-  It is a **runtime** KV quantization: it works with the public
-  `qwen3_6_35b_a3b.ninfer` artifact. `bf16`/`int8`/`fp8` are also accepted.
-- `--wddm-evictable-budget` — see [Windows WDDM note](#windows-wddm-and-dedicated-gpus).
-- `--kv-capacity auto` resolves the largest pool that fits after weights;
-  explicit values are fixed for the process lifetime.
-- `--spec mtp --draft-tokens 3` (MTP3) or `--spec dflash2 --draft-tokens 7`
-  (DFlash2, needs the DFlash2 companion artifact).
-- `--max-concurrency` / `--device-state-slots`: one state slot per active
-  request; keep them equal for the simplest scheduling.
-- Multi-GPU: set `CUDA_VISIBLE_DEVICES` to the index of *your* GPU as seen by
-  CUDA. Note that CUDA's enumeration order can differ from `nvidia-smi`'s
-  order on multi-GPU systems — verify with a short probe run or by watching
-  which card's VRAM moves.
+---
 
-### Verified 260k profile (35B-A3B, this hardware)
+### 模型转换（ternary-convert）
 
-The table row that uses 96 % of the 24 GB card:
+`tools/ternary-convert` 把 **Ternary-Bonsai-2-27B** 的 GGUF（PQ2_0 / PTQ1_0 两种三元打包）
+转成 zatfung 能直接加载的 `.ninfer` artifact。主转换器是 `pack_zatfung.py`
+（由上游 `pack.py` 改造：路径环境变量化 + 修掉 PTQ1_0 自检 bug）：
 
-```bat
-ninfer-serve.exe qwen3_6_35b_a3b.ninfer ^
- --host 127.0.0.1 --port 8080 ^
- --max-context 260000 --kv-capacity 260000 --kv-dtype rk4v4-e8 ^
- --wddm-evictable-budget --max-concurrency 4 --device-state-slots 4 ^
- --spec mtp --draft-tokens 3 --lm-head-draft --prefill-chunk 2048
+```sh
+# 前提：CPU 版 torch 即可，不需要 CUDA 版
+pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+
+cd tools/ternary-convert
+set ZATFUNG_ROOT=<zatfung 仓库根>              # 提供 tools.artifact
+set ZATFUNG_TEMPLATE=<上一步产出的完整模板路径>
+set ZATFUNG_GGUF=<GGUF 路径>
+python pack_zatfung.py check                  # 先验证几何/解码/字节往返，不写文件
+python pack_zatfung.py build <输出>.ninfer    # 产出
 ```
 
----
+- **GGUF 来源**：`Ternary-Bonsai-2-27B-PQ2_0.gguf`（type 142）与
+  `Ternary-Bonsai-2-27B-PTQ1_0.gguf`（type 143），需自行从发布方获取。
+  **权重版权归其原作者与发布方所有，本仓库不包含、也不重新分发任何模型权重**；
+  由权重产出的 `.ninfer` 制品属权重派生品，再分发义务以权重原许可为准。
+- **产物为何比 GGUF 大 ~3.1 GiB**：文本权重一分未变，膨胀全部来自 GGUF 里没有的
+  借用模块（dflash2 / mtp / draft_head / vision / frontend，共 419 对象 3.114 GiB，
+  全部从模板借用）。
+- 完整操作记录与踩坑见 [`tools/ternary-convert/CONVERSION_NOTES.md`](tools/ternary-convert/CONVERSION_NOTES.md)。
 
-## Supported Models
-
-Primary target:
-
-| Model | Weights | Artifact | Download and model card |
-|---|---|---|---|
-| Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
-
-Also verified on this branch (measured above). Model artifacts:
-**Neroued** (NInfer checkpoints on HuggingFace).
-
-| Model | Artifact | Download |
-|---|---|---|
-| Qwen3.8-27B | `qwen3_8_27b.ninfer` (`--kv-dtype rk4v4-e8`, MTP3) | [Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) |
-| Qwen3.8-27B DFlash2 | `qwen3_8_27b_dflash2.ninfer` (dflash2, 7 drafts) | the public artifact above + DFlash companion, merged with the upstream converter pipeline; the merged artifact is not yet on Neroued's public HF (2026-09-08) |
+更多文档见 [`docs/README.md`](docs/README.md) 索引。
 
 ---
 
-## Requirements
-
-- 64-bit Windows 11 (Native, **no WSL2 required**)
-- NVIDIA GeForce RTX 4090 (`sm_89`)
-- NVIDIA driver with CUDA 13.x support (pre-compiled ZIP)
-- Microsoft Visual C++ Redistributable 2015–2022 (x64)
-- Source builds only: Visual Studio 2022 BuildTools, CUDA 13.3, CMake 3.28+, Ninja
-
----
-
-## Installation (Pre-compiled)
-
-**Download the [ninfer-4090-windows-v1.0.8.zip](https://github.com/Ambolio/ninfer-4090-windows/releases/download/v1.0.8-windows/ninfer-4090-windows-v1.0.8.zip) from the [v1.0.8-windows release](https://github.com/Ambolio/ninfer-4090-windows/releases/tag/v1.0.8-windows).**
-
-The ZIP contains `ninfer-serve.exe` with its runtime DLLs (FFmpeg), a generic
-`start_4090.bat`, a `download_model.bat`, and a `LEEME.txt` with instructions
-and model links.
-
-1. Extract the ZIP to a folder.
-2. Run `download_model.bat` to download the `qwen3_6_35b_a3b.ninfer` model
-   file (or download manually from
-   [HuggingFace](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/main/qwen3_6_35b_a3b.ninfer)).
-3. Double-click `start_4090.bat` to launch the server.
-4. Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`.
-
----
-
-## Building from Source (For Developers)
-
-### 1. Build Automatically
-
-```cmd
-build_v1.0.8.bat
-```
-
-Self-contained: sm_89, vision, Release. Needs this tree + MSVC BuildTools +
-CUDA 13.3 + Ninja. Pass an alternative build directory as the first argument.
-
-### 2. Manual CMake Build
-
-Open the **x64 Native Tools Command Prompt** and run:
-
-```cmd
-cmake -B build -S . -G Ninja -DCMAKE_CUDA_ARCHITECTURES=89 -DNINFER_ENABLE_AVX2=ON -DNINFER_BUILD_MEDIA_ACQUIRE=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release -j 32
-```
-
----
-
-## Capabilities and limits
-
-All registered model IDs support:
-
-- text generation with thinking and non-thinking prompt modes;
-- image, multi-image, video, and mixed multimodal messages;
-- chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
-- MTP3 speculative decoding with draft windows from one to five, DFlash2
-  (`--spec dflash2 --draft-tokens 7`, verified e2e on this branch), and DFlash
-  legacy (`K=1..15`) on the 35B-A3B target;
-- BF16, INT8, FP8, and the sm_89-only `rk4v4`/`rk4v4-e8` lattice KV storage;
-- offline causal-perplexity scoring;
-- private and shared exact-prefix reuse with Device/Host State and KV retention;
-- model-aware sampling defaults and explicit sampler overrides;
-- OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages,
-  including streaming, tools, local response state, token counting, and usage
-  accounting.
-
-The product boundary remains intentionally small:
-
-- one RTX 4090 and one resident model per Engine;
-- a startup-fixed capacity of one to eight active requests with bounded FIFO ingress;
-- no request preemption, priority/QoS, active-request swapping, weight offload,
-  multi-GPU, or distributed serving;
-- one shared startup-fixed KV pool across active requests and retained prefixes;
-- no runtime model discovery or unregistered checkpoint fallback;
-- parsed tool calls are returned to the client; NInfer does not execute tools;
-- the in-tree C++ headers are not distributed as an installed SDK.
-
-`--max-context` is each sequence's logical limit. `--kv-capacity` sizes the
-shared Main Text KV pool used by active requests and retained prefixes; `auto`
-resolves the largest legal capacity at startup from the memory remaining after
-weights. Explicit capacities remain fixed for the process lifetime.
-
----
-
-## Documentation
-
-- [Documentation index](docs/README.md)
-- [CLI](docs/cli.md)
-- [HTTP serving](docs/serving.md)
-- [Performance](docs/performance.md)
-- [Perplexity evaluation](docs/perplexity.md)
-- [Port notes v1.0.6 (sm_89 decisions, verification)](PORT_v1.0.6.md)
-- [Contributing](CONTRIBUTING.md)
-
-Run the relevant `--help` for the exact current option contract.
-
-## Support
-
-NInfer is a personal project that Neroued develops out of interest. If you find
-it useful and would like to support its continued development, you can
-[support the project on Ko-fi](https://ko-fi.com/neroued).
-
-Support is entirely voluntary. It is not a purchase or investment and does not
-come with financial returns, promised services or features, or a role in
-project decisions.
-
----
-
-## License & Attribution
-
-This project is licensed under the [Apache License 2.0](LICENSE).
-
-This repository is a Windows MSVC adaptation of the upstream
-[Neroued/ninfer](https://github.com/Neroued/ninfer) project, originally
-authored by **Neroued** and licensed under the Apache License 2.0. In
-accordance with Apache License 2.0 Section 4, all original attribution and
-copyright notices are retained; the lineage credits above and the
-[NOTICE](NOTICE) file are part of the distribution.
-
-The published artifacts are derived from
-[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) and the
-Qwen 3.8 family. NVFP4 quantizations: [unsloth](https://huggingface.co/unsloth).
-DFlash companion weights: [z-lab](https://huggingface.co/z-lab). These source
-repositories are distributed under their own licenses. Vendored dependencies
-retain their own license files under `third_party/`.
-
-**Third-party binary distribution.** The pre-compiled ZIP packages include
-FFmpeg shared libraries (avcodec, avformat, avutil, swresample, swscale) from
-the BtbN `ffmpeg-master-latest-win64-gpl-shared` build, distributed under
-GPL v2 or later; the full license text ships as `LICENSE-FFMPEG.txt` in the
-ZIP and in the repository root. The corresponding source is the FFmpeg
-source tree of that build (https://ffmpeg.org,
-https://github.com/BtbN/FFmpeg-Builds). NVIDIA, CUDA, and RTX are trademarks
-of NVIDIA Corporation. Model weights are **not** redistributed with this
-project: users download them directly from HuggingFace under the model
-owners' own licenses.
-
-**Disclaimer.** This software is provided "as is" (AS IS), without warranty
-of any kind, express or implied. The authors are not liable for hardware
-damage, system instability, data loss, or overheating resulting from the use
-of these binaries or configurations, including configurations that run the
-GPU at or near its full memory and power envelope. You use this software at
-your own responsibility.
+> 本仓库是衍生作品，衍生自上游 **[CraneBW/ninfer-ternary-bonsai-ada](https://github.com/CraneBW/ninfer-ternary-bonsai-ada)**（NINFER Ada 线的假三元 Bonsai 2 27B 移植）。
