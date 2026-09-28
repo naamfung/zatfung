@@ -24,8 +24,7 @@ KV / block_table 架构完全重写）：设备显存只驻留一个小的工作
 - `86`（本机 3060 Ti）已跑通构建 + 全量单测（111/111）+ 端到端生成。
 - `75` 目前**只到编译层**：全量构建通过，MMA 与 warp 归约的 Turing 降级做过硬件级等价验证，
   但尚无 2080 Ti 实机验收，且 prompt attention 的 tile 超出 Turing 每 block 64 KiB 的
-  opt-in 上限。缺口清单与后续步骤见
-  [`docs/zatfung-sm86-sm75-port.md`](docs/zatfung-sm86-sm75-port.md) 第 8 节。
+  opt-in 上限。缺口清单与后续步骤记录在内部设计文档中。
 
 > **构建入口是 `builder.go`** —— 一个 Go 写的生产标准构建器。它会自己探测并拼装
 > MSVC 环境（不依赖 `vcvars64.bat`），因此在 `cmd.exe` 被禁用、Visual Studio
@@ -136,9 +135,7 @@ ctest --output-on-failure                        # 运行全部测试
   未必与 `nvidia-smi` 一致）。`--max-context` / `--kv-capacity` / `--max-concurrency`
   按显存与负载自行调。
 - 运行期 KV 量化（`--kv-dtype`）不改权重，公开的 `.ninfer` 产物可直接使用。
-- 完整选项契约见 [`docs/serving.md`](docs/serving.md)；CLI 用法见
-  [`docs/cli.md`](docs/cli.md)；性能与 PPL 评测见
-  [`docs/performance.md`](docs/performance.md) / [`docs/perplexity.md`](docs/perplexity.md)。
+- 完整选项契约、CLI 用法、性能与 PPL 评测记录在内部文档中（不随仓库发布）。
 
 **长上下文与显存受限场景**：用下文的 KVMem —— 它把 KV cache 与显存上限解耦，
 是本 fork 在 NINFER 架构下首发并独立实现的机制，真假三元 27B 都适用。
@@ -286,8 +283,7 @@ CUDA Graph 开启，确定性请求（temperature 0）。首字延迟 = 提交�
   draft 3）—— 本机 8 GB 极限配置不加载 MTP/DFlash，且架构低两档，两口径不可直接比较。
 - **Q1/Q2 权衡**：Q1 省 1.17 GiB 显存（free 744 MiB，可开更大的池与窗口），代价是
   填充 -15%、生成 -14%；Q2 把显存用到只剩 10 MiB 换全速。MMA prefill 路径两种格式
-  都已具备（Q1 的实现见
-  [`docs/ptq1-prefill-mma-design.md`](docs/ptq1-prefill-mma-design.md)）；Q1 的解码
+  都已具备；Q1 的解码
   热路径还带一张每 CTA 的 base-3 数字查找表（值与算术解码逐位一致）。
 
 ---
@@ -343,8 +339,6 @@ python pack_zatfung.py build <输出>.ninfer    # 产出
   借用模块（dflash2 / mtp / draft_head / vision / frontend，共 419 对象 3.114 GiB，
   全部从模板借用）。
 - 完整操作记录与踩坑见 [`tools/ternary-convert/CONVERSION_NOTES.md`](tools/ternary-convert/CONVERSION_NOTES.md)。
-
-更多文档见 [`docs/README.md`](docs/README.md) 索引。
 
 ---
 

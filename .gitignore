@@ -15,9 +15,10 @@ ffmpeg_temp/
 fix_api.py
 fix_cost.py
 _build_*/
+build-SM*/
 __pycache__/
 *.pyc
 profiles/
 _bench/
 _probe/
-.github/
+.github/docs/
