@@ -1,26 +1,35 @@
 // MODIFIED for zatfung (zat6 疾 fung1 风 引擎).
-// KVMem K2 prototype: in-place K phase re-rotation for int8-group64 cached pages.
+// KVMem K2: in-place K phase re-rotation for int8-group64 cached pages.
 //
 // When the KVMem window compacts selected blocks into new slots, every moved
 // block's cached K carries RoPE phases of its OLD window slot while the
 // attention kernel will read it at the NEW slot (the kernel derives positions
 // from block-table indices). This kernel re-bakes the phases:
 //
-//   stored = Quant(H64(RoPE_src(K_raw)))          (group 0 only; RoPE domain is
-//   re-baked = Quant(H64(RoPE_dst(H64(Dequant(stored)))))   dims [0,64) = group 0)
+//   stored   = Quant_g(H256(RoPE_src(K_raw)))
+//   re-baked = Quant_g(H256(RoPE_dst(H256(Dequant_g(stored)))))
+//
+// The stored domain is the FULL-ROW normalized H256 rotation -- the exact
+// convention of the production append kernels (kv_cache_append_full_i8_kernel /
+// kv_cache_append_full_i8_page_kernel), of the attention Q path and of the KVMem
+// scorer. H256 is an involution, so de-rotation and re-rotation share
+// normalized_hadamard_d256_inplace. Because that transform mixes all four 64-dim
+// groups, re-baking rewrites every group's codes and scales; treating the page as
+// a per-group H64 and rewriting group 0 alone -- as an earlier revision of this
+// kernel did -- corrupts the moved page. The rotary pairs only exist in the RAW
+// domain, which is why the whole row is de-rotated first.
 //
 // RoPE here is Qwen3.6 Text MRoPE: rotary_dim 64, split-half pairs (p, p+32)
 // for p in [0,32), angle phi = positions[axis(p)] * kTextRopeInvFrequency[p],
-// axis = p % 3 (src/ops/kernel/rope.cuh). H64 is the warp-shuffle normalized
-// Hadamard (kv_cache_hadamard64) -- an involution, so de-rotation and
-// re-rotation use the same helper. Groups 1..3 are position-free and pass
-// through untouched.
+// axis = p % 3 (src/ops/kernel/rope.cuh). After the H256 undo the raw rotary pair
+// (p, p+32) sits at (row[0], row[1]) of lane p -- the same lane layout the KVMem
+// scoring kernel uses for its un-RoPE.
 //
-// One warp owns one (page, token, head): lane l holds dims l and l+32, which is
-// simultaneously one H64 butterfly lane-pair and one RoPE pair. Everything uses
-// the exact production helpers (kv_cache_hadamard64, kv_cache_int8_quant_*)
-// so a re-baked page is bit-consistent with what the append path would have
-// written for the same raw K at the new position (up to fp reassociation).
+// One warp owns one (page, token, head): lane l holds dims l + 32*r in row[r].
+// Everything uses the exact production helpers (normalized_hadamard_d256_inplace,
+// kv_cache_int8_quant_*) so a re-baked page is bit-consistent with what the append
+// path would have written for the same raw K at the new position (up to fp
+// reassociation).
 
 #pragma once
 
@@ -53,7 +62,7 @@ inline void kvmem_cuda_check(cudaError_t err, const char* expr, const char* file
 // the append path writes for the same raw K at the new position.
 using namespace ninfer::ops;
 
-// One warp re-bakes group 0 of one (page, token, head).
+// One warp re-bakes one (page, token, head).
 //   codes/scales : the device page (page-major layout of paged_kv_element_offset)
 //   src_pos/dst_pos : [axis * 64 + token] absolute MRoPE positions, page-local
 //                     token index (layout matches the engine's positions[T,3]
@@ -75,41 +84,49 @@ __global__ void kvmem_rerope_int8_g64_kernel(std::int8_t* codes, __half* scales,
     const std::int64_t scale_base =
         paged_kv_element_offset<kKVCacheInt8Groups, KVHeads>(page, head, token, 0);
 
-    // -- dequant group 0 (dims lane, lane+32) --
-    const float s = __half2float(scales[scale_base]);
-    float x0 = static_cast<float>(codes[code_base + lane]) * s;
-    float x1 = static_cast<float>(codes[code_base + lane + 32]) * s;
-
-    // -- undo the H64 quantization rotation (involution) --
-    kv_cache_hadamard64(x0, x1);
+    // -- dequant the full row (dims lane + 32*r), then undo the H256 rotation --
+    float row[8];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int d   = lane + 32 * r;
+        const float s = __half2float(scales[scale_base + r / 2]);
+        row[r]        = static_cast<float>(codes[code_base + d]) * s;
+    }
+    normalized_hadamard_d256_inplace(row, lane);
 
     // -- un-RoPE at the baked slot, re-RoPE at the new slot --
-    const int pair  = lane;  // rotary pairs are (p, p+32) for p in [0,32)
-    const int axis  = pair % 3;
+    // The raw rotary pair (p, p+32) sits at (row[0], row[1]) of lane p.
+    const int axis = lane % 3;
     const float phi_src =
-        static_cast<float>(src_pos[axis * valid_tokens + token]) * kTextRopeInvFrequency[pair];
+        static_cast<float>(src_pos[axis * valid_tokens + token]) * kTextRopeInvFrequency[lane];
     const float phi_dst =
-        static_cast<float>(dst_pos[axis * valid_tokens + token]) * kTextRopeInvFrequency[pair];
+        static_cast<float>(dst_pos[axis * valid_tokens + token]) * kTextRopeInvFrequency[lane];
     float ss = 0.0f, cs = 0.0f, sd = 0.0f, cd = 0.0f;
     sincosf(phi_src, &ss, &cs);
     sincosf(phi_dst, &sd, &cd);
     // stored pair convention (apply_rope_head): x0' = x0*cos - x1*sin; x1' = x1*cos + x0*sin
-    const float u0 = x0 * cs + x1 * ss;  // inverse: sin flips sign
-    const float u1 = x1 * cs - x0 * ss;
-    float v0 = u0 * cd - u1 * sd;
-    float v1 = u1 * cd + u0 * sd;
+    const float u0 = row[0] * cs + row[1] * ss;  // inverse: sin flips sign
+    const float u1 = row[1] * cs - row[0] * ss;
+    row[0]         = u0 * cd - u1 * sd;
+    row[1]         = u1 * cd + u0 * sd;
 
-    // -- re-apply H64 and re-quantize group 0 --
-    kv_cache_hadamard64(v0, v1);
-    float absmax = fmaxf(fabsf(v0), fabsf(v1));
+    // -- re-apply the H256 rotation and re-quantize every group --
+    normalized_hadamard_d256_inplace(row, lane);
+
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, offset));
+    for (int group = 0; group < kKVCacheInt8Groups; ++group) {
+        float absmax = fmaxf(fabsf(row[2 * group]), fabsf(row[2 * group + 1]));
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, offset));
+        }
+        const KVCacheInt8QuantParams qp = kv_cache_int8_quant_params(absmax);
+        const int d0                   = group * kKVCacheInt8Group + lane;
+        const int d1                   = d0 + 32;
+        codes[code_base + d0] = kv_cache_int8_quant_code(row[2 * group], qp.inverse_scale);
+        codes[code_base + d1] = kv_cache_int8_quant_code(row[2 * group + 1], qp.inverse_scale);
+        if (lane == 0) { scales[scale_base + group] = qp.scale; }
     }
-    const KVCacheInt8QuantParams qp = kv_cache_int8_quant_params(absmax);
-    codes[code_base + lane]      = kv_cache_int8_quant_code(v0, qp.inverse_scale);
-    codes[code_base + lane + 32] = kv_cache_int8_quant_code(v1, qp.inverse_scale);
-    scales[scale_base]           = qp.scale;
 }
 
 // Launcher: re-bakes `pages` whole pages (all 64 tokens). A partially filled

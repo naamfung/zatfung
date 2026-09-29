@@ -1,9 +1,15 @@
-// MODIFIED for zatfung (zat6 疾 fung1 风 引擎).
+// MODIFIED for zatfung (zat⁶ 疾 fung¹ 风 引擎).
 // Store-level K1b compaction test: a real LogicalKVPageStore +
 // KVAddressSpaceStore over a real page pool, driving the lifecycle exactly
 // like the runtime (activate -> ensure -> commit -> deactivate -> compact),
-// then verifying the compacted window byte-for-byte where position-free and
-// against a CPU re-phase model for group 0.
+// then verifying the compacted window byte-for-byte for position-free planes
+// and against a CPU full-row H256 re-phase model for the K planes.
+//
+// The re-phase model mirrors the PRODUCTION append convention: stored K =
+// Quant_g(H256(RoPE_baked(raw))) with per-group-of-64 FP16 scales. Because the
+// full-row H256 mixes all four groups, a re-bake rewrites every group (an
+// earlier revision of the model assumed a per-group H64 that only touched
+// group 0; that convention does not match the append path).
 //
 // Run: builder.exe -test tests/kvmem_compact_test.cu
 
@@ -47,26 +53,32 @@ int failures = 0;
 
 float host_freq(int pair) { return std::pow(1e7f, -2.0f * static_cast<float>(pair) / 64.0f); }
 
-void hadamard64_warp(float* e) {
-    for (int bit = 1; bit < 32; bit <<= 1) {
-        float a[32], b[32];
-        for (int l = 0; l < 32; ++l) {
-            const int p   = l ^ bit;
-            const bool hi = (l & bit) != 0;
-            a[l] = hi ? e[p] - e[l] : e[l] + e[p];
-            b[l] = hi ? e[p + 32] - e[l + 32] : e[l + 32] + e[p + 32];
-        }
-        for (int l = 0; l < 32; ++l) {
-            e[l]      = a[l];
-            e[l + 32] = b[l];
+// Host mirror of normalized_hadamard_d256_inplace (dims indexed d = l + 32*r).
+void hadamard256_host(float* e) {
+    for (int stride = 1; stride <= 16; stride <<= 1) {
+        for (int r = 0; r < 8; ++r) {
+            float tmp[32];
+            for (int l = 0; l < 32; ++l) {
+                const float v = e[l + 32 * r];
+                const float p = e[(l ^ stride) + 32 * r];
+                tmp[l]        = (l & stride) == 0 ? v + p : p - v;
+            }
+            for (int l = 0; l < 32; ++l) { e[l + 32 * r] = tmp[l]; }
         }
     }
-    for (int l = 0; l < 32; ++l) {
-        const float A = e[l];
-        const float B = e[l + 32];
-        e[l]      = (A + B) * 0.125f;
-        e[l + 32] = (A - B) * 0.125f;
+    for (int span = 1; span < 8; span <<= 1) {
+        for (int base = 0; base < 8; base += 2 * span) {
+            for (int off = 0; off < span; ++off) {
+                for (int l = 0; l < 32; ++l) {
+                    const float lo = e[l + 32 * (base + off)];
+                    const float hi = e[l + 32 * (base + off + span)];
+                    e[l + 32 * (base + off)]        = lo + hi;
+                    e[l + 32 * (base + off + span)] = lo - hi;
+                }
+            }
+        }
     }
+    for (int i = 0; i < 256; ++i) { e[i] *= 0x1p-4f; }
 }
 
 void rope_group0(float* e, std::int32_t position, bool inverse) {
@@ -83,7 +95,7 @@ void rope_group0(float* e, std::int32_t position, bool inverse) {
     }
 }
 
-// Quantize a rotated group the way the append path does.
+// Quantize one rotated group the way the append path does.
 void quantize_group(const float* g, std::int8_t* codes, unsigned short* scale_bits) {
     float absmax = 0.0f;
     for (int i = 0; i < 64; ++i) { absmax = std::max(absmax, std::fabs(g[i])); }
@@ -98,41 +110,41 @@ void quantize_group(const float* g, std::int8_t* codes, unsigned short* scale_bi
     *scale_bits = bits;
 }
 
-// The stored group-0 model for block `page` baked at window position
-// `baked`: Quant(H64(RoPE_baked(raw))).
-void expected_group0(const std::vector<float>& raw, int page, int layer, int head, int token,
-                     std::int32_t baked, std::int8_t* codes, unsigned short* scale_bits) {
-    float g[64];
-    for (int l = 0; l < 32; ++l) {
-        g[l]      = raw[((static_cast<std::size_t>(page) * kLayers + layer) * kHeads + head) *
-                            kTokens * 64 +
-                        static_cast<std::size_t>(token) * 64 + l];
-        g[l + 32] = raw[((static_cast<std::size_t>(page) * kLayers + layer) * kHeads + head) *
-                            kTokens * 64 +
-                        static_cast<std::size_t>(token) * 64 + l + 32];
+// The stored full-row model for block `page` baked at window position
+// `baked`: Quant_g(H256(RoPE_baked(raw))). Fills 256 codes + 4 scale bits.
+void expected_row(const std::vector<float>& raw, int page, int layer, int head, int token,
+                  std::int32_t baked, std::int8_t* codes, unsigned short* scale_bits) {
+    float row[256];
+    const std::size_t base =
+        ((static_cast<std::size_t>(page) * kLayers + layer) * kHeads + head) * kTokens * 256 +
+        static_cast<std::size_t>(token) * 256;
+    for (int d = 0; d < 256; ++d) { row[d] = raw[base + static_cast<std::size_t>(d)]; }
+    rope_group0(row, baked, false);
+    hadamard256_host(row);
+    for (int g = 0; g < kGroups; ++g) {
+        quantize_group(row + g * 64, codes + g * 64, scale_bits + g);
     }
-    rope_group0(g, baked, false);
-    hadamard64_warp(g);
-    quantize_group(g, codes, scale_bits);
 }
 
-// The kernel's float sequence applied to the STORED quantized group:
-// dequant -> H64^-1 -> un-RoPE(from) -> RoPE(to) -> H64 -> quantize.
-// `stored` holds the 64 group-0 codes of the block as baked at from_pos.
-void expected_rephase(const std::int8_t* stored, unsigned short stored_bits,
+// The kernel's float sequence applied to the STORED quantized row:
+// dequant -> H256^-1 -> un-RoPE(from) -> RoPE(to) -> H256 -> per-group requantize.
+// `stored` holds the 256 K codes of the block as baked at from_pos.
+void expected_rephase(const std::int8_t* stored, const unsigned short* stored_bits,
                       std::int32_t from_pos, std::int32_t to_pos, std::int8_t* codes,
                       unsigned short* scale_bits) {
-    float g[64];
-    const float s = __half2float(__ushort_as_half(stored_bits));
-    for (int l = 0; l < 32; ++l) {
-        g[l]      = static_cast<float>(stored[l]) * s;
-        g[l + 32] = static_cast<float>(stored[l + 32]) * s;
+    float row[256];
+    for (int d = 0; d < 256; ++d) {
+        const float s =
+            __half2float(__ushort_as_half(stored_bits[d / 64]));
+        row[d] = static_cast<float>(stored[d]) * s;
     }
-    hadamard64_warp(g);
-    rope_group0(g, from_pos, true);
-    rope_group0(g, to_pos, false);
-    hadamard64_warp(g);
-    quantize_group(g, codes, scale_bits);
+    hadamard256_host(row);
+    rope_group0(row, from_pos, true);
+    rope_group0(row, to_pos, false);
+    hadamard256_host(row);
+    for (int g = 0; g < kGroups; ++g) {
+        quantize_group(row + g * 64, codes + g * 64, scale_bits + g);
+    }
 }
 
 // Plane addressing (PageMajor, element units of the plane dtype).
@@ -204,19 +216,19 @@ int main() {
             return pool.physical_index_of(pages.physical(logicals[static_cast<std::size_t>(slot)]));
         };
 
-        // ---- fill: raw K group-0 baked at the natural slot; fillers elsewhere ----
-        std::vector<float> raw(static_cast<std::size_t>(kPages) * kLayers * kHeads * kTokens * 64);
+        // ---- fill: full K rows baked at the natural slot; fillers elsewhere ----
+        std::vector<float> raw(static_cast<std::size_t>(kPages) * kLayers * kHeads * kTokens * 256);
         for (auto& v : raw) { v = static_cast<float>(std::rand() % 2001 - 1000) / 1000.0f; }
-        // Simulated ledger: the group-0 the device SHOULD hold per block, as
+        // Simulated ledger: the full K row the device SHOULD hold per block, as
         // baked at baked_now[blk]. Updated through the same chain the kernel
         // runs, so skip blocks compare bitwise and moved blocks within one
         // code step (GPU sincosf vs CPU sin/cos ulp noise).
         std::vector<int> baked_now(static_cast<std::size_t>(kPages), -1);
         std::vector<char> resident(static_cast<std::size_t>(kPages), 0);
         std::vector<std::int8_t> sim_codes(static_cast<std::size_t>(kPages) * kLayers * kHeads *
-                                           kTokens * 64);
+                                           kTokens * 256);
         std::vector<unsigned short> sim_bits(static_cast<std::size_t>(kPages) * kLayers * kHeads *
-                                             kTokens);
+                                             kTokens * kGroups);
         const auto sim_idx = [&](int blk, int l, int h, int t) {
             return ((static_cast<std::size_t>(blk) * kLayers + l) * kHeads + h) * kTokens + t;
         };
@@ -243,24 +255,24 @@ int main() {
                 const std::size_t ks = static_cast<std::size_t>(l * 4 + 2);
                 for (int h = 0; h < kHeads; ++h) {
                     for (int t = 0; t < kTokens; ++t) {
-                        std::int8_t codes[64];
-                        unsigned short bits;
+                        std::int8_t codes[256];
+                        unsigned short bits[kGroups];
                         // The engine convention: content is baked at the block's
                         // window slot (== ledger baked_pos).
-                        expected_group0(raw, i, l, h, t, i * kTokens + t, codes, &bits);
+                        expected_row(raw, i, l, h, t, i * kTokens + t, codes, bits);
                         auto* dst = reinterpret_cast<std::int8_t*>(
                                         host_plane[kc].data() + kc_page) +
                                     in_page_elems(256, h, t, 0);
-                        for (int d = 0; d < 64; ++d) { dst[d] = codes[d]; }
+                        for (int d = 0; d < 256; ++d) { dst[d] = codes[d]; }
                         auto* ks_ptr = reinterpret_cast<unsigned short*>(
                             host_plane[ks].data() + ks_page) +
                                        in_page_elems(4, h, t, 0);
-                        ks_ptr[0] = bits;
+                        for (int g = 0; g < kGroups; ++g) { ks_ptr[g] = bits[g]; }
                         const std::size_t si = sim_idx(i, l, h, t);
-                        for (int d = 0; d < 64; ++d) {
-                            sim_codes[si * 64 + static_cast<std::size_t>(d)] = codes[d];
+                        for (int d = 0; d < 256; ++d) {
+                            sim_codes[si * 256 + static_cast<std::size_t>(d)] = codes[d];
                         }
-                        sim_bits[si] = bits;
+                        for (int g = 0; g < kGroups; ++g) { sim_bits[si * kGroups + g] = bits[g]; }
                     }
                 }
             }
@@ -312,10 +324,10 @@ int main() {
             return buf;
         };
 
-        // Verify the compacted window: slot s holds block sel[s]; V planes and
-        // K groups 1..3 bitwise untouched; group 0 re-baked from the stored
-        // quantized values through the SAME rotate chain the kernel runs (the
-        // fresh-bake ideal differs by the double-quantization noise).
+        // Verify the compacted window: slot s holds block sel[s]; V planes
+        // bitwise untouched; the full K row re-baked from the stored quantized
+        // values through the SAME rotate chain the kernel runs (the fresh-bake
+        // ideal differs by the double-quantization noise).
         auto verify_window = [&](const int* sel, int window_pages) {
             const std::vector<LogicalKVPageHandle> logicals = store.window_page_handles(*handle);
             CHECK(static_cast<int>(logicals.size()) == window_pages, "logicals %zu (want %d)",
@@ -355,86 +367,59 @@ int main() {
                     const auto ksd = download_page(l * 4 + 2, phys);
                     for (int h = 0; h < kHeads; ++h) {
                         for (int t = 0; t < kTokens; ++t) {
-                            // scale: group 0 fp16 at element (h*64+t)*4
-                            const std::size_t scale_elem =
-                                static_cast<std::size_t>(in_page_elems(4, h, t, 0));
-                            const unsigned short got_bits =
-                                static_cast<unsigned short>(ksd[scale_elem * 2]) |
-                                static_cast<unsigned short>(ksd[scale_elem * 2 + 1]) << 8;
-                            const float got_scale = __half2float(__ushort_as_half(got_bits));
-                            std::int8_t want_codes[64];
-                            unsigned short want_bits;
-                            const std::size_t kc_page =
-                                static_cast<std::size_t>(elems_per_page(256) * blk);
-                            const std::size_t ks_page =
-                                static_cast<std::size_t>(elems_per_page(4) * blk) * 2;
-                            const std::int8_t* stored =
-                                reinterpret_cast<const std::int8_t*>(
-                                    host_plane[static_cast<std::size_t>(l * 4)].data() +
-                                    kc_page) +
-                                in_page_elems(256, h, t, 0);
-                            const unsigned short stored_bits =
-                                *reinterpret_cast<const unsigned short*>(
-                                    host_plane[static_cast<std::size_t>(l * 4 + 2)].data() +
-                                    ks_page) +
-                                in_page_elems(4, h, t, 0);
                             const std::size_t si = sim_idx(blk, l, h, t);
+                            std::int8_t want_codes[256];
+                            unsigned short want_bits[kGroups];
                             if (blk_skip) {
                                 // The kernel left this block untouched.
-                                for (int d = 0; d < 64; ++d) {
-                                    want_codes[d] = sim_codes[si * 64 + static_cast<std::size_t>(d)];
+                                for (int d = 0; d < 256; ++d) {
+                                    want_codes[d] = sim_codes[si * 256 + static_cast<std::size_t>(d)];
                                 }
-                                want_bits = sim_bits[si];
+                                for (int g = 0; g < kGroups; ++g) {
+                                    want_bits[g] = sim_bits[si * kGroups + g];
+                                }
                             } else {
                                 // CPU mirror of the kernel's float sequence,
                                 // reading the PRE-round sim.
-                                expected_rephase(&sim_codes[si * 64], sim_bits[si],
+                                expected_rephase(&sim_codes[si * 256], &sim_bits[si * kGroups],
                                                  baked_pre + t, s * kTokens + t, want_codes,
-                                                 &want_bits);
+                                                 want_bits);
+                                for (int d = 0; d < 256; ++d) {
+                                    new_codes[si * 256 + static_cast<std::size_t>(d)] = want_codes[d];
+                                }
+                                for (int g = 0; g < kGroups; ++g) {
+                                    new_bits[si * kGroups + g] = want_bits[g];
+                                }
+                            }
+                            for (int g = 0; g < kGroups; ++g) {
+                                // scale: group g fp16 at element (h*64+t)*4 + g
+                                const std::size_t scale_elem =
+                                    static_cast<std::size_t>(in_page_elems(4, h, t, g));
+                                const unsigned short got_bits =
+                                    static_cast<unsigned short>(ksd[scale_elem * 2]) |
+                                    static_cast<unsigned short>(ksd[scale_elem * 2 + 1]) << 8;
+                                const float got_scale = __half2float(__ushort_as_half(got_bits));
+                                const float want_scale =
+                                    __half2float(__ushort_as_half(want_bits[g]));
+                                CHECK(std::fabs(got_scale - want_scale) <=
+                                          1e-3f * want_scale + 1e-7f,
+                                      "scale s%d l%d h%d t%d g%d", s, l, h, t, g);
                                 for (int d = 0; d < 64; ++d) {
-                                    new_codes[si * 64 + static_cast<std::size_t>(d)] = want_codes[d];
-                                }
-                                new_bits[si] = want_bits;
-                            }
-                            const float want_scale = __half2float(__ushort_as_half(want_bits));
-                            if (s == 1 && l == 0 && h == 0 && t == 1) {
-                                std::printf("DBG2: got_scale=%.6f want_scale=%.6f "
-                                            "from=%d sim0=%d\n",
-                                            got_scale, want_scale,
-                                            baked_now[static_cast<std::size_t>(blk)],
-                                            static_cast<int>(sim_codes[si * 64]));
-                                for (int d = 0; d < 6; ++d) {
-                                    std::printf("  d%d got=%d want=%d\n", d,
-                                                static_cast<int>(static_cast<std::int8_t>(
-                                                    kcd[static_cast<std::size_t>(
-                                                        in_page_elems(256, h, t, d))])),
-                                                static_cast<int>(want_codes[d]));
-                                }
-                            }
-                            CHECK(std::fabs(got_scale - want_scale) <=
-                                      1e-3f * want_scale + 1e-7f,
-                                  "scale s%d l%d h%d t%d", s, l, h, t);
-                            for (int d = 0; d < 64; ++d) {
-                                const float got = static_cast<float>(static_cast<std::int8_t>(
-                                                      kcd[static_cast<std::size_t>(
-                                                          in_page_elems(256, h, t, d))])) *
-                                                  got_scale;
-                                const double diff =
-                                    std::fabs(static_cast<double>(got) - want_codes[d] * want_scale);
-                                CHECK(diff <= 1.01 * static_cast<double>(got_scale),
-                                      "code s%d l%d h%d t%d d%d", s, l, h, t, d);
-                            }
-                            // K groups 1..3: untouched vs the block's
-                            // original host fill.
-                            for (int d = 64; d < 256; ++d) {
-                                const std::size_t byte_idx = static_cast<std::size_t>(
-                                    in_page_elems(256, h, t, d));
-                                const std::size_t src_idx =
-                                    static_cast<std::size_t>(elems_per_page(256) * blk) +
-                                    byte_idx;
-                                if (kcd[byte_idx] != host_plane[static_cast<std::size_t>(l * 4)][src_idx]) {
-                                    CHECK(false, "k g1-3 s%d l%d h%d t%d d%d", s, l, h, t, d);
-                                    break;
+                                    const float got =
+                                        static_cast<float>(static_cast<std::int8_t>(
+                                            kcd[static_cast<std::size_t>(
+                                                in_page_elems(256, h, t, g * 64 + d))])) *
+                                        got_scale;
+                                    const double diff =
+                                        std::fabs(static_cast<double>(got) -
+                                                  static_cast<double>(want_codes[g * 64 + d]) *
+                                                      want_scale);
+                                    CHECK(diff <= 1.01 * static_cast<double>(got_scale),
+                                          "code s%d l%d h%d t%d g%d d%d", s, l, h, t, g, d);
+                                    if (failures > 20) {
+                                        std::printf("too many failures, abort\n");
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -448,11 +433,13 @@ int main() {
                         for (int h = 0; h < kHeads; ++h) {
                             for (int t = 0; t < kTokens; ++t) {
                                 const std::size_t si = sim_idx(blk, l, h, t);
-                                for (int d = 0; d < 64; ++d) {
-                                    sim_codes[si * 64 + static_cast<std::size_t>(d)] =
-                                        new_codes[si * 64 + static_cast<std::size_t>(d)];
+                                for (int d = 0; d < 256; ++d) {
+                                    sim_codes[si * 256 + static_cast<std::size_t>(d)] =
+                                        new_codes[si * 256 + static_cast<std::size_t>(d)];
                                 }
-                                sim_bits[si] = new_bits[si];
+                                for (int g = 0; g < kGroups; ++g) {
+                                    sim_bits[si * kGroups + g] = new_bits[si * kGroups + g];
+                                }
                             }
                         }
                     }

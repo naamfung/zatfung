@@ -2,10 +2,14 @@
 // `builder.exe -test tests/kvmem_rerope_test.cu`).
 //
 // Pipeline under test (int8-group64 K page, MRoPE text):
-//   stored = Quant(H64(RoPE_src(raw)))
-//   kernel re-bakes src -> dst, compared against a CPU reference that mirrors
-//   the exact float op sequence. Groups 1..3 are position-free and must be
-//   bitwise untouched.
+//   stored = Quant_g(H256(RoPE_src(raw)))
+//   kernel re-bakes src -> dst; the result is compared against a fresh append at
+//   the new slot, mirroring the exact float op sequence.
+//
+// The stored domain is the FULL-ROW normalized H256 rotation -- the same one the
+// production append kernels, the attention Q path and the KVMem scorer use. It mixes
+// all four 64-dim groups, so the re-phase has to rewrite every group: a per-group H64
+// treatment of group 0 alone (what this kernel used to do) corrupts the moved page.
 #include "kvmem/kvmem_rerope.cuh"
 
 #include <algorithm>
@@ -40,27 +44,35 @@ int failures = 0;
 // Mirrors kTextRopeInvFrequency: theta^(-2*pair/64) with the Qwen3.6 text theta.
 float host_freq(int pair) { return std::pow(1e7f, -2.0f * static_cast<float>(pair) / 64.0f); }
 
-// -- warp-faithful H64 on a 64-element group (lane l owns e[l], e[l+32]) --
-void hadamard64_warp(float* e) {
-    for (int bit = 1; bit < 32; bit <<= 1) {
-        float a[32], b[32];
-        for (int l = 0; l < 32; ++l) {
-            const int p   = l ^ bit;
-            const bool hi = (l & bit) != 0;
-            a[l] = hi ? e[p] - e[l] : e[l] + e[p];
-            b[l] = hi ? e[p + 32] - e[l + 32] : e[l + 32] + e[p + 32];
-        }
-        for (int l = 0; l < 32; ++l) {
-            e[l]      = a[l];
-            e[l + 32] = b[l];
+// -- warp-faithful H256 on a full 256-dim row: lane l owns dims l + 32*r --
+// H32 across the 32 lanes, applied to each of the 8 register columns, then H8 across
+// those columns, normalized by 2^-4. This is hadamard_d256.cuh's
+// normalized_hadamard_d256_inplace as a host mirror.
+void hadamard256_host(float* e) {
+    for (int stride = 1; stride <= 16; stride <<= 1) {
+        for (int r = 0; r < 8; ++r) {
+            float tmp[32];
+            for (int l = 0; l < 32; ++l) {
+                const float v = e[l + 32 * r];
+                const float p = e[(l ^ stride) + 32 * r];
+                tmp[l]        = (l & stride) == 0 ? v + p : p - v;
+            }
+            for (int l = 0; l < 32; ++l) { e[l + 32 * r] = tmp[l]; }
         }
     }
-    for (int l = 0; l < 32; ++l) {
-        const float A = e[l];
-        const float B = e[l + 32];
-        e[l]      = (A + B) * 0.125f;
-        e[l + 32] = (A - B) * 0.125f;
+    for (int span = 1; span < 8; span <<= 1) {
+        for (int base = 0; base < 8; base += 2 * span) {
+            for (int off = 0; off < span; ++off) {
+                for (int l = 0; l < 32; ++l) {
+                    const float lo = e[l + 32 * (base + off)];
+                    const float hi = e[l + 32 * (base + off + span)];
+                    e[l + 32 * (base + off)]        = lo + hi;
+                    e[l + 32 * (base + off + span)] = lo - hi;
+                }
+            }
+        }
     }
+    for (int i = 0; i < 256; ++i) { e[i] *= 0x1p-4f; }
 }
 
 // MRoPE text: pair p in [0,32) pairs (p, p+32), axis = p % 3.
@@ -112,35 +124,36 @@ int main() {
         }
     }
 
-    // -- stored = Quant(H64(RoPE_src(raw))), the append pipeline on host --
+    // -- stored = Quant_g(H256(RoPE_src(raw))), the production append pipeline on host --
+    // The append kernels rotate the WHOLE 256-dim row and then quantize each 64-dim group
+    // with its own absmax/127 scale; RoPE touches only the rotary dims [0,64).
     std::vector<std::int8_t> stored_codes(code_count);
     std::vector<unsigned short> stored_scales(scale_count);
-    std::vector<float> group(64);
+    std::vector<float> row(256);
     for (int pg = 0; pg < kPages; ++pg) {
         for (int h = 0; h < kHeads; ++h) {
             for (int t = 0; t < kTokens; ++t) {
                 const std::int32_t pos3[3] = {src_pos3[(pg * kTokens + t) * 3 + 0],
                                               src_pos3[(pg * kTokens + t) * 3 + 1],
                                               src_pos3[(pg * kTokens + t) * 3 + 2]};
+                for (int d = 0; d < 256; ++d) { row[d] = raw[code_off(pg, h, t, d)]; }
+                rope_group0(row.data(), pos3, false);
+                hadamard256_host(row.data());
                 for (int g = 0; g < kGroups; ++g) {
-                    for (int l = 0; l < 32; ++l) {
-                        group[l]      = raw[code_off(pg, h, t, g * 64 + l)];
-                        group[l + 32] = raw[code_off(pg, h, t, g * 64 + l + 32)];
-                    }
-                    if (g == 0) { rope_group0(group.data(), pos3, false); }
-                    hadamard64_warp(group.data());
                     float absmax = 0.0f;
-                    for (int i = 0; i < 64; ++i) { absmax = std::max(absmax, std::fabs(group[i])); }
+                    for (int i = 0; i < 64; ++i) {
+                        absmax = std::max(absmax, std::fabs(row[g * 64 + i]));
+                    }
                     const unsigned short bits =
                         __half_as_ushort(__float2half_rn(absmax > 0.0f ? absmax / 127.0f : 0.0f));
-                    const float s = __half2float(__ushort_as_half(bits));
+                    const float s   = __half2float(__ushort_as_half(bits));
                     const float inv = s > 0.0f ? 1.0f / s : 0.0f;
                     for (int i = 0; i < 64; ++i) {
-                        const int q =
-                            std::max(-127, std::min(127, static_cast<int>(std::lrintf(group[i] * inv))));
+                        const int q = std::max(
+                            -127, std::min(127, static_cast<int>(std::lrintf(row[g * 64 + i] * inv))));
                         stored_codes[code_off(pg, h, t, g * 64 + i)] = static_cast<std::int8_t>(q);
-                        stored_scales[scale_off(pg, h, t, g)]        = bits;
                     }
+                    stored_scales[scale_off(pg, h, t, g)] = bits;
                 }
             }
         }
@@ -167,28 +180,11 @@ int main() {
     cudaMemcpy(out_codes.data(), d_codes, code_count, cudaMemcpyDeviceToHost);
     cudaMemcpy(out_scales.data(), d_scales, scale_count * 2, cudaMemcpyDeviceToHost);
 
-    // -- check 1: groups 1..3 bitwise untouched --
-    std::size_t touched = 0;
-    for (int pg = 0; pg < kPages; ++pg) {
-        for (int h = 0; h < kHeads; ++h) {
-            for (int t = 0; t < kTokens; ++t) {
-                for (int g = 1; g < kGroups; ++g) {
-                    for (int i = 0; i < 64; ++i) {
-                        const std::size_t idx = static_cast<std::size_t>(
-                            code_off(pg, h, t, g * 64 + i));
-                        if (out_codes[idx] != stored_codes[idx]) { ++touched; }
-                    }
-                    if (out_scales[static_cast<std::size_t>(scale_off(pg, h, t, g))] !=
-                        stored_scales[static_cast<std::size_t>(scale_off(pg, h, t, g))]) {
-                        ++touched;
-                    }
-                }
-            }
-        }
-    }
-    CHECK(touched == 0, "groups 1..3 must be bitwise untouched (%zu changed)", touched);
-
-    // -- check 2: group 0 vs CPU reference (mirrors the kernel's float sequence) --
+    // -- the moved page must equal a fresh append at the NEW slot --
+    // Dequant the full row with its per-group scales, undo H256, move the RoPE phases,
+    // re-apply H256 and requantize: exactly what the append path would have written at
+    // the dst position. The old per-group-H64 treatment of group 0 alone lands far
+    // outside these tolerances, so this check is what pins the rotation domain.
     double worst = 0.0;
     int bad_codes = 0, scale_mismatch = 0;
     for (int pg = 0; pg < kPages; ++pg) {
@@ -200,44 +196,45 @@ int main() {
                 const std::int32_t posd3[3] = {dst_pos3[(pg * kTokens + t) * 3 + 0],
                                                dst_pos3[(pg * kTokens + t) * 3 + 1],
                                                dst_pos3[(pg * kTokens + t) * 3 + 2]};
-                for (int l = 0; l < 32; ++l) {
+                for (int d = 0; d < 256; ++d) {
                     const float s = __half2float(__ushort_as_half(
-                        stored_scales[static_cast<std::size_t>(scale_off(pg, h, t, 0))]));
-                    group[l]      = static_cast<float>(stored_codes[code_off(pg, h, t, l)]) * s;
-                    group[l + 32] = static_cast<float>(stored_codes[code_off(pg, h, t, l + 32)]) * s;
+                        stored_scales[static_cast<std::size_t>(scale_off(pg, h, t, d / 64))]));
+                    row[d] = static_cast<float>(stored_codes[code_off(pg, h, t, d)]) * s;
                 }
-                hadamard64_warp(group.data());
-                rope_group0(group.data(), pos3, true);
-                rope_group0(group.data(), posd3, false);
-                hadamard64_warp(group.data());
-                float absmax = 0.0f;
-                for (int i = 0; i < 64; ++i) { absmax = std::max(absmax, std::fabs(group[i])); }
-                const unsigned short ref_bits =
-                    __half_as_ushort(__float2half_rn(absmax > 0.0f ? absmax / 127.0f : 0.0f));
-                const std::size_t got_scale_idx =
-                    static_cast<std::size_t>(scale_off(pg, h, t, 0));
-                // GPU sincosf vs CPU sin/cos differ in the last ulp, so the absmax
-                // can round to the neighboring fp16. Value-level tolerance, not bits.
-                const float ref_scale = __half2float(__ushort_as_half(ref_bits));
-                const float got_scale =
-                    __half2float(__ushort_as_half(out_scales[got_scale_idx]));
-                if (std::fabs(got_scale - ref_scale) >
-                    1e-3f * ref_scale + 1e-7f) {
-                    ++scale_mismatch;
-                }
-                for (int i = 0; i < 64; ++i) {
-                    const float got =
-                        static_cast<float>(out_codes[code_off(pg, h, t, i)]) * got_scale;
-                    const double d = std::fabs(static_cast<double>(got) - group[i]);
-                    worst = std::max(worst, d);
-                    if (d > 1.01f * got_scale) { ++bad_codes; }
+                hadamard256_host(row.data());
+                rope_group0(row.data(), pos3, true);
+                rope_group0(row.data(), posd3, false);
+                hadamard256_host(row.data());
+                for (int g = 0; g < kGroups; ++g) {
+                    float absmax = 0.0f;
+                    for (int i = 0; i < 64; ++i) {
+                        absmax = std::max(absmax, std::fabs(row[g * 64 + i]));
+                    }
+                    const unsigned short ref_bits = __half_as_ushort(
+                        __float2half_rn(absmax > 0.0f ? absmax / 127.0f : 0.0f));
+                    const float ref_scale = __half2float(__ushort_as_half(ref_bits));
+                    const float got_scale = __half2float(__ushort_as_half(
+                        out_scales[static_cast<std::size_t>(scale_off(pg, h, t, g))]));
+                    // GPU sincosf vs CPU sin/cos differ in the last ulp, so the absmax can
+                    // round to the neighbouring fp16. Value-level tolerance, not bits.
+                    if (std::fabs(got_scale - ref_scale) > 1e-3f * ref_scale + 1e-7f) {
+                        ++scale_mismatch;
+                    }
+                    for (int i = 0; i < 64; ++i) {
+                        const float got = static_cast<float>(
+                                              out_codes[code_off(pg, h, t, g * 64 + i)]) *
+                                          got_scale;
+                        const double d = std::fabs(static_cast<double>(got) - row[g * 64 + i]);
+                        worst          = std::max(worst, d);
+                        if (d > 1.01f * got_scale) { ++bad_codes; }
+                    }
                 }
             }
         }
     }
-    CHECK(scale_mismatch == 0, "group-0 scales must match the CPU model (%d differ)",
+    CHECK(scale_mismatch == 0, "scales must match a fresh append at the new slot (%d differ)",
           scale_mismatch);
-    CHECK(bad_codes == 0, "group-0 codes within one step of the CPU model (%d bad)", bad_codes);
+    CHECK(bad_codes == 0, "codes must land within one step of a fresh append (%d bad)", bad_codes);
     std::printf("worst dequant diff = %.6f\n", worst);
 
     std::printf("failures=%d  VERDICT: %s\n", failures, failures == 0 ? "PASS" : "FAIL");
