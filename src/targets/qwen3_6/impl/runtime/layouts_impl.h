@@ -11,6 +11,7 @@
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
@@ -405,6 +406,25 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        // ...AND THE OP THAT RUNS ON THOSE BUFFERS NEEDS ITS OWN SCRATCH. The flush builds
+        // its logits with ops::linear(hidden, output_head, logits, A16Only, work, ...), and a
+        // folded-ternary output head rotates the activation into its basis first -- the same
+        // [input_width, tokens] BF16 reservation the prefill stage's lm_head makes through
+        // folded_rotation_bytes (variant.cpp). Hand-sizing this segment to logits + two 4 KB
+        // vectors left it at exactly 508,567,552 B with no margin, so a --context above 980
+        // died on bad_alloc the moment the rotation was needed (columns saturate at
+        // kCausalScoreTile = 1024, which is why the corpus size never mattered).
+        //
+        // Ask the op's own capacity query rather than repeating the arithmetic. The qtype is
+        // nominal: those two artifacts share one branch of linear_workspace_capacity_bytes()
+        // and the ternary return value does not depend on it, which is the same reason
+        // folded_rotation_bytes() can pin PQ2_0_G128 for both. If the branches ever diverge,
+        // this has to carry the artifact's real output-head qtype instead.
+        scratch(causal_score,
+                ops::linear_workspace_capacity_bytes(QType::PQ2_0_G128, TextConfig::hidden,
+                                                     TextConfig::hidden,
+                                                     ops::LinearPolicy::A16Only, 1,
+                                                     static_cast<std::int32_t>(kCausalScoreTile)));
         out.causal_score = finish(causal_score);
     }
 
